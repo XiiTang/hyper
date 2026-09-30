@@ -296,3 +296,32 @@ impl OriginalHeaderOrder {
         self.entry_order.iter()
     }
 }
+
+/// A request-scoped check run after client admission, before dispatching its head.
+/// It is not retained for responses, bodies, or subsequent requests.
+#[cfg(feature = "client")]
+#[derive(Clone)]
+pub struct RequestGuard(
+    std::sync::Arc<dyn Fn() -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync>,
+);
+#[cfg(feature = "client")]
+impl RequestGuard {
+    /// Construct a check whose error is returned without dispatching the request.
+    pub fn new<F, E>(check: F) -> Self
+    where
+        F: Fn() -> Result<(), E> + Send + Sync + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        Self(std::sync::Arc::new(move || check().map_err(Into::into)))
+    }
+    /// Check permission at the operation's dispatch boundary.
+    pub fn check(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        (self.0)()
+    }
+}
+#[cfg(feature = "client")]
+impl std::fmt::Debug for RequestGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RequestGuard")
+    }
+}

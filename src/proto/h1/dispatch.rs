@@ -684,6 +684,15 @@ cfg_client! {
                             Poll::Ready(None)
                         }
                         Poll::Pending => {
+                            if let Some(guard) = req.extensions().get::<crate::ext::RequestGuard>() {
+                                if let Err(error) = guard.check() {
+                                    cb.send(Err(TrySendError {
+                                        error: crate::Error::new_user_body(error),
+                                        message: None,
+                                    }));
+                                    return Poll::Ready(None);
+                                }
+                            }
                             let (parts, body) = req.into_parts();
                             let head = RequestHead {
                                 version: parts.version,

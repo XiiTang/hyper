@@ -704,6 +704,15 @@ where
                         trace!("request callback is canceled");
                         continue;
                     }
+                    if let Some(guard) = req.extensions().get::<crate::ext::RequestGuard>() {
+                        if let Err(error) = guard.check() {
+                            cb.send(Err(TrySendError {
+                                error: crate::Error::new_user_body(error),
+                                message: None,
+                            }));
+                            continue;
+                        }
+                    }
                     let (head, body) = req.into_parts();
                     let mut req = ::http::Request::from_parts(head, ());
                     super::strip_connection_headers(req.headers_mut(), super::MessageKind::Request);
