@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::rt::{Read, Write};
 use bytes::{Buf, Bytes};
 use futures_core::ready;
-use http::header::{HeaderValue, CONNECTION};
+use http::header::{CONNECTION, HeaderValue};
 use http::{HeaderMap, Method, Version};
 use http_body::Frame;
 use httparse::ParserConfig;
@@ -488,13 +488,18 @@ where
         debug_assert!(!self.can_read_head() && !self.can_read_body() && !self.is_read_closed());
         debug_assert!(self.is_mid_message());
 
-        if self.state.allow_half_close || !self.io.read_buf().is_empty() {
+        if !self.io.read_buf().is_empty() {
             return Poll::Pending;
         }
 
         let num_read = ready!(self.force_io_read(cx)).map_err(crate::Error::new_io)?;
 
-        if num_read == 0 {
+        if num_read == 0 && self.state.allow_half_close {
+            // A FIN closes only the read direction. Continue the pending
+            // response; read errors still terminate the connection above.
+            self.state.close_read();
+            Poll::Ready(Ok(()))
+        } else if num_read == 0 {
             trace!("found unexpected EOF on busy connection: {:?}", self.state);
             self.state.close_read();
             Poll::Ready(Err(crate::Error::new_incomplete()))
@@ -522,7 +527,7 @@ where
 
         match self.state.reading {
             Reading::Continue(..) | Reading::Body(..) | Reading::KeepAlive | Reading::Closed => {
-                return
+                return;
             }
             Reading::Init => (),
         }
@@ -1268,12 +1273,12 @@ mod tests {
 
     use super::*;
     use crate::common::io::Compat;
+    #[cfg(feature = "server")]
+    use crate::proto::RequestLine;
     #[cfg(feature = "client")]
     use crate::proto::h1::ClientTransaction;
     #[cfg(feature = "server")]
     use crate::proto::h1::ServerTransaction;
-    #[cfg(feature = "server")]
-    use crate::proto::RequestLine;
     use bytes::Bytes;
 
     fn poll_head<I, T>(
