@@ -5,11 +5,11 @@ use std::io::IoSlice;
 use bytes::buf::{Chain, Take};
 use bytes::{Buf, Bytes};
 use http::{
+    HeaderMap, HeaderName,
     header::{
         AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
         CONTENT_TYPE, HOST, MAX_FORWARDS, SET_COOKIE, TE, TRAILER, TRANSFER_ENCODING,
     },
-    HeaderMap, HeaderName,
 };
 
 use super::io::WriteBuf;
@@ -22,6 +22,7 @@ type StaticBuf = &'static [u8];
 pub(crate) struct Encoder {
     kind: Kind,
     is_last: bool,
+    allow_late_trailers: bool,
 }
 
 #[derive(Debug)]
@@ -62,7 +63,12 @@ impl Encoder {
         Encoder {
             kind,
             is_last: false,
+            allow_late_trailers: false,
         }
+    }
+    pub(crate) fn allow_late_trailers(mut self, allow: bool) -> Self {
+        self.allow_late_trailers = allow;
+        self
     }
     pub(crate) fn chunked() -> Encoder {
         Encoder::new(Kind::Chunked(None))
@@ -82,6 +88,7 @@ impl Encoder {
             Kind::Chunked(_) => Encoder {
                 kind: Kind::Chunked(Some(trailers)),
                 is_last: self.is_last,
+                allow_late_trailers: self.allow_late_trailers,
             },
             _ => self,
         }
@@ -167,8 +174,8 @@ impl Encoder {
     ) -> Option<EncodedBuf<B>> {
         trace!("encoding trailers");
         match &self.kind {
-            Kind::Chunked(Some(allowed_trailer_fields)) => {
-                let allowed_set: HashSet<&HeaderName> = allowed_trailer_fields.iter().collect();
+            Kind::Chunked(fields) if fields.is_some() || self.allow_late_trailers => {
+                let allowed_set: HashSet<&HeaderName> = fields.iter().flatten().collect();
 
                 let mut cur_name = None;
                 let mut allowed_trailers = HeaderMap::new();
@@ -179,7 +186,7 @@ impl Encoder {
                     }
                     let name = cur_name.as_ref().expect("current header name");
 
-                    if allowed_set.contains(name) {
+                    if self.allow_late_trailers || allowed_set.contains(name) {
                         if is_valid_trailer_field(name) {
                             allowed_trailers.append(name, value);
                         } else {
@@ -431,11 +438,11 @@ impl std::error::Error for NotEof {}
 mod tests {
     use bytes::BufMut;
     use http::{
+        HeaderMap, HeaderName, HeaderValue,
         header::{
             AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
             CONTENT_TYPE, HOST, MAX_FORWARDS, SET_COOKIE, TE, TRAILER, TRANSFER_ENCODING,
         },
-        HeaderMap, HeaderName, HeaderValue,
     };
 
     use super::super::io::Cursor;
@@ -602,9 +609,11 @@ mod tests {
             HeaderValue::from_static("header data"),
         )]);
 
-        assert!(encoder
-            .encode_trailers::<&[u8]>(headers.clone(), false)
-            .is_none());
+        assert!(
+            encoder
+                .encode_trailers::<&[u8]>(headers.clone(), false)
+                .is_none()
+        );
 
         let trailers = vec![];
         let encoder = encoder.into_chunked_with_trailing_fields(trailers);
