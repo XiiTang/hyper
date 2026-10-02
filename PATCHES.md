@@ -9,3 +9,10 @@
 - Regression evidence: `tests/request_guard.rs` covers revocation after enqueue,
   absence of an HTTP/1 request on the wire, and HTTP/2 rejection without a peer
   operation or loss of the connection's next independently authorized request.
+
+## Connection header preservation (2026-10-02)
+
+Backport hyper #4196, 74a39081ff1496970fb75da75c5282b23a9b69e5, preserving
+existing Connection tokens when adding close/keep-alive. Retain the dispatch
+guard, half-close and bounded flush changes. `cargo test --features full`
+passes on macOS arm64, including upstream exact-wire tests.
