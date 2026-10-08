@@ -279,7 +279,7 @@ where
                             (
                                 Request::from_parts(
                                     parts,
-                                    IncomingBody::h2(stream, content_length.into(), ping),
+                                    IncomingBody::h2(stream, content_length.into(), ping, None),
                                 ),
                                 None,
                             )

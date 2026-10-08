@@ -648,9 +648,12 @@ where
 
                     Poll::Ready(Ok(res))
                 } else {
+                    // The request body may still be sending: the response body
+                    // takes over cancelling it.
+                    let cancel = this.cancel_tx.take();
                     let res = res.map(|stream| {
                         let ping = ping.for_stream(&stream);
-                        IncomingBody::h2(stream, content_length.into(), ping)
+                        IncomingBody::h2(stream, content_length.into(), ping, cancel)
                     });
                     Poll::Ready(Ok(res))
                 }

@@ -68,6 +68,10 @@ enum Kind {
         data_done: bool,
         ping: ping::Recorder,
         recv: h2::RecvStream,
+        /// A client response's link to its request body's pipe: dropping the
+        /// body before the response ends resets the stream, as dropping the
+        /// response future does before the headers arrive.
+        cancel: Option<futures_channel::oneshot::Sender<()>>,
     },
     #[cfg(feature = "ffi")]
     Ffi(crate::ffi::UserBody),
@@ -155,6 +159,7 @@ impl Incoming {
         recv: h2::RecvStream,
         mut content_length: DecodedLength,
         ping: ping::Recorder,
+        cancel: Option<futures_channel::oneshot::Sender<()>>,
     ) -> Self {
         // If the stream is already EOS, then the "unknown length" is clearly
         // actually ZERO.
@@ -167,6 +172,7 @@ impl Incoming {
             ping,
             content_length,
             recv,
+            cancel,
         })
     }
 
@@ -179,6 +185,26 @@ impl Incoming {
         match &mut self.kind {
             Kind::Ffi(body) => body,
             _ => unreachable!(),
+        }
+    }
+}
+
+#[cfg(all(feature = "http2", any(feature = "client", feature = "server")))]
+impl Drop for Incoming {
+    fn drop(&mut self) {
+        // A response dropped before its end leaves the request body's pipe
+        // waiting, perhaps for flow-control capacity the peer never grants;
+        // tell it to reset the stream, so the peer learns of the cancellation
+        // and the capacity is freed.
+        if let Kind::H2 {
+            recv,
+            cancel: cancel @ Some(_),
+            ..
+        } = &mut self.kind
+        {
+            if !recv.is_end_stream() {
+                let _ = cancel.take().expect("matched Some").send(());
+            }
         }
     }
 }
@@ -235,6 +261,7 @@ impl Body for Incoming {
                 ping,
                 recv: h2,
                 content_length: len,
+                ..
             } => {
                 if !*data_done {
                     match ready!(h2.poll_data(cx)) {
@@ -484,7 +511,8 @@ mod tests {
         // the size by too much.
 
         let body_size = mem::size_of::<Incoming>();
-        let body_expected_size = mem::size_of::<u64>() * 5;
+        // An HTTP/2 client body also holds its request body's cancel sender.
+        let body_expected_size = mem::size_of::<u64>() * 6;
         assert!(
             body_size <= body_expected_size,
             "Body size = {} <= {}",
