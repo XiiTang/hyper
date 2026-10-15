@@ -272,7 +272,7 @@ where
     B: Body,
     T: Read + Write + Unpin,
 {
-    type Output = Result<(), ()>;
+    type Output = crate::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
@@ -284,9 +284,7 @@ where
         if polled.is_ready() {
             *this.is_terminated = true;
         }
-        polled.map_err(|_e| {
-            debug!(error = %_e, "connection error");
-        })
+        polled.map_err(crate::Error::new_h2)
     }
 }
 
@@ -340,14 +338,15 @@ where
     B: Body,
     T: Read + Write + Unpin,
 {
-    type Output = ();
+    type Output = crate::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
 
-        if !this.conn.is_terminated() && Pin::new(&mut this.conn).poll(cx).is_ready() {
-            // ok or err, the `conn` has finished.
-            return Poll::Ready(());
+        if !this.conn.is_terminated() {
+            if let Poll::Ready(result) = Pin::new(&mut this.conn).poll(cx) {
+                return Poll::Ready(result);
+            }
         }
 
         if !this.drop_rx.is_terminated() && Pin::new(&mut this.drop_rx).poll_next(cx).is_ready() {
@@ -385,6 +384,9 @@ pin_project! {
             #[pin]
             task: ConnTask<T, B>,
         },
+        Ready {
+            result: Option<crate::Result<()>>,
+        },
     }
 }
 
@@ -395,7 +397,7 @@ where
     T: Read + Write + Unpin,
     E: Http2UpgradedExec<B::Data>,
 {
-    type Output = ();
+    type Output = crate::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
         let this = self.project();
@@ -404,6 +406,9 @@ where
             H2ClientFutureProject::Pipe { pipe } => pipe.poll(cx),
             H2ClientFutureProject::Send { send_when } => send_when.poll(cx),
             H2ClientFutureProject::Task { task } => task.poll(cx),
+            H2ClientFutureProject::Ready { result } => {
+                Poll::Ready(result.take().expect("Future polled twice"))
+            }
         }
     }
 }
@@ -475,7 +480,7 @@ where
     B: http_body::Body,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    type Output = ();
+    type Output = crate::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
         let mut this = self.project();
@@ -490,7 +495,7 @@ where
                 this.pipe.as_mut().send_reset(h2::Reason::CANCEL);
                 drop(this.conn_drop_ref.take().expect("Future polled twice"));
                 drop(this.ping.take().expect("Future polled twice"));
-                return Poll::Ready(());
+                return Poll::Ready(Ok(()));
             }
             Some(Poll::Ready(Err(_))) => {
                 // Sender dropped without cancelling (normal response or error).
@@ -502,12 +507,9 @@ where
 
         match Pin::new(&mut this.pipe).poll(cx) {
             Poll::Ready(result) => {
-                if let Err(_e) = result {
-                    debug!("client request body error: {}", _e);
-                }
                 drop(this.conn_drop_ref.take().expect("Future polled twice"));
                 drop(this.ping.take().expect("Future polled twice"));
-                return Poll::Ready(());
+                return Poll::Ready(result);
             }
             Poll::Pending => (),
         }
@@ -534,10 +536,14 @@ where
             if !f.eos {
                 let mut pipe = PipeToSendStream::new(f.body, f.body_tx);
 
-                // eagerly see if the body pipe is ready and
-                // can thus skip allocating in the executor
+                // Eager completion takes the same executor result path as a
+                // pending pipe, without polling the completed pipe twice.
                 match Pin::new(&mut pipe).poll(cx) {
-                    Poll::Ready(_) => (),
+                    Poll::Ready(result) => {
+                        self.executor.execute_h2_future(H2ClientFuture::Ready {
+                            result: Some(result),
+                        });
+                    }
                     Poll::Pending => {
                         let conn_drop_ref = self.conn_drop_ref.clone();
                         // keep the ping recorder's knowledge of an

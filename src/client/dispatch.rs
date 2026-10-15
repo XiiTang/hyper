@@ -281,19 +281,32 @@ impl<T, U> Callback<T, U> {
         }
     }
 
-    pub(crate) fn send(mut self, val: Result<U, TrySendError<T>>) {
+    pub(crate) fn send(self, val: Result<U, TrySendError<T>>) {
+        let _ = self.send_result(val);
+    }
+
+    // Transfer an error to the request, or return it when its waiter is gone.
+    pub(crate) fn send_result(mut self, val: Result<U, TrySendError<T>>) -> crate::Result<()> {
         match &mut self {
             Callback::Retry(tx) => {
-                let _ = tx
+                match tx
                     .take()
                     .expect("callback sender not dropped before send")
-                    .send(val);
+                    .send(val)
+                {
+                    Err(Err(error)) => Err(error.error),
+                    _ => Ok(()),
+                }
             }
             Callback::NoRetry(tx) => {
-                let _ = tx
+                match tx
                     .take()
                     .expect("callback sender not dropped before send")
-                    .send(val.map_err(|e| e.error));
+                    .send(val.map_err(|e| e.error))
+                {
+                    Err(Err(error)) => Err(error),
+                    _ => Ok(()),
+                }
             }
         }
     }
@@ -349,7 +362,7 @@ where
     B: Body + 'static,
     E: crate::rt::bounds::Http2UpgradedExec<B::Data>,
 {
-    type Output = ();
+    type Output = crate::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
@@ -357,10 +370,7 @@ where
         let mut call_back = this.call_back.take().expect("polled after complete");
 
         match Pin::new(&mut this.when).poll(cx) {
-            Poll::Ready(Ok(res)) => {
-                call_back.send(Ok(res));
-                Poll::Ready(())
-            }
+            Poll::Ready(Ok(res)) => Poll::Ready(call_back.send_result(Ok(res))),
             Poll::Pending => {
                 // check if the callback is canceled
                 match call_back.poll_canceled(cx) {
@@ -375,11 +385,10 @@ where
                 // Tell pipe_task to reset the h2 stream so that
                 // RST_STREAM is sent and flow-control capacity freed.
                 this.when.as_mut().cancel();
-                Poll::Ready(())
+                Poll::Ready(Ok(()))
             }
             Poll::Ready(Err((error, message))) => {
-                call_back.send(Err(TrySendError { error, message }));
-                Poll::Ready(())
+                Poll::Ready(call_back.send_result(Err(TrySendError { error, message })))
             }
         }
     }

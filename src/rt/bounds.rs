@@ -66,7 +66,7 @@ mod h2_client {
         E: super::Http2UpgradedExec<B::Data>,
         B: http_body::Body + 'static,
         B::Error: Into<Box<dyn Error + Send + Sync>>,
-        H2ClientFuture<B, T, E>: Future<Output = ()>,
+        H2ClientFuture<B, T, E>: Future<Output = crate::Result<()>>,
         T: Read + Write + Unpin,
     {
         fn execute_h2_future(&mut self, future: H2ClientFuture<B, T, E>) {
@@ -81,7 +81,7 @@ mod h2_client {
         E: super::Http2UpgradedExec<B::Data>,
         B: http_body::Body + 'static,
         B::Error: Into<Box<dyn Error + Send + Sync>>,
-        H2ClientFuture<B, T, E>: Future<Output = ()>,
+        H2ClientFuture<B, T, E>: Future<Output = crate::Result<()>>,
         T: Read + Write + Unpin,
     {
     }
