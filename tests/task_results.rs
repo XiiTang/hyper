@@ -111,11 +111,18 @@ async fn executor_reads_h2_connection_error() {
         hyper::client::conn::http2::handshake::<_, _, Empty<Bytes>>(executor.clone(), BrokenIo)
             .await
             .unwrap();
-    let error = next(&mut results).await.unwrap_err();
+    executor.execute(connection);
+    let error = loop {
+        if let Err(error) = next(&mut results).await {
+            break error;
+        }
+    };
     assert!(format!("{error:?}").contains("h2-connection-marker"));
     drop(sender);
-    let _ = connection.await;
     executor.join().await;
+    while let Ok(result) = results.try_recv() {
+        assert!(result.is_ok(), "duplicate: {result:?}");
+    }
 }
 
 struct FailingBody(Option<oneshot::Receiver<()>>);
@@ -249,4 +256,245 @@ async fn executor_does_not_repeat_an_error_delivered_to_the_request() {
     while let Ok(result) = results.try_recv() {
         assert!(result.is_ok(), "duplicate: {result:?}");
     }
+}
+
+async fn upload_reset(reason: h2::Reason) {
+    let (executor, mut results) = Recording::new();
+    let (io, peer) = tokio::io::duplex(4096);
+    let (reset, reset_now) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut connection = h2::server::handshake(peer).await.unwrap();
+        let (_request, mut response) = connection.accept().await.unwrap().unwrap();
+        let mut upload = response
+            .send_response(http::Response::new(()), true)
+            .unwrap();
+        let driver = tokio::spawn(async move { while connection.accept().await.is_some() {} });
+        reset_now.await.unwrap();
+        upload.send_reset(reason);
+        drop(upload);
+        driver.await.unwrap();
+    });
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(executor.clone(), TokioIo::new(io))
+            .await
+            .unwrap();
+    let worker = tokio::spawn(connection);
+    let (_frames, frames) = futures_channel::mpsc::unbounded::<Result<Frame<Bytes>, io::Error>>();
+    let response = sender
+        .send_request(
+            Request::post("https://fixture.test/")
+                .body(http_body_util::StreamBody::new(frames))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.body().is_end_stream());
+    reset.send(()).unwrap();
+    // SendWhen publishes first; the upload's end is a second owned end.
+    let mut errors = Vec::new();
+    for _ in 0..2 {
+        if let Err(error) = next(&mut results).await {
+            errors.push(error);
+        }
+    }
+    assert_eq!(
+        errors.len(),
+        usize::from(reason != h2::Reason::NO_ERROR),
+        "{errors:?}"
+    );
+    if let Some(error) = errors.first() {
+        assert!(format!("{error:?}").contains("INTERNAL_ERROR"));
+    }
+    drop(response);
+    drop(sender);
+    worker.await.unwrap().unwrap();
+    executor.join().await;
+    server.await.unwrap();
+    while let Ok(result) = results.try_recv() {
+        assert!(result.is_ok(), "{result:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_peers_ordinary_upload_stop_is_clean() {
+    upload_reset(h2::Reason::NO_ERROR).await;
+}
+
+#[tokio::test]
+async fn a_peers_failed_upload_stop_is_reported_once() {
+    upload_reset(h2::Reason::INTERNAL_ERROR).await;
+}
+
+async fn local_cancellation(after_headers: bool) {
+    let (executor, mut results) = Recording::new();
+    let (io, peer) = tokio::io::duplex(4096);
+    let (seen, request_seen) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut connection = h2::server::handshake(peer).await.unwrap();
+        let (request, mut response) = connection.accept().await.unwrap().unwrap();
+        let response_body = after_headers.then(|| {
+            response
+                .send_response(http::Response::new(()), false)
+                .unwrap()
+        });
+        seen.send(()).unwrap();
+        while connection.accept().await.is_some() {}
+        drop((request, response, response_body));
+    });
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(executor.clone(), TokioIo::new(io))
+            .await
+            .unwrap();
+    let worker = tokio::spawn(connection);
+    let (_frames, frames) = futures_channel::mpsc::unbounded::<Result<Frame<Bytes>, io::Error>>();
+    let response = sender.send_request(
+        Request::post("https://fixture.test/")
+            .body(http_body_util::StreamBody::new(frames))
+            .unwrap(),
+    );
+    request_seen.await.unwrap();
+    if after_headers {
+        drop(response.await.unwrap());
+    } else {
+        drop(response);
+    }
+    drop(sender);
+    worker.await.unwrap().unwrap();
+    executor.join().await;
+    server.await.unwrap();
+    let mut count = 0;
+    while let Ok(result) = results.try_recv() {
+        count += 1;
+        assert!(result.is_ok(), "{result:?}");
+    }
+    assert!(count >= 2);
+}
+#[tokio::test]
+async fn cancelling_a_response_future_is_clean() {
+    local_cancellation(false).await;
+}
+#[tokio::test]
+async fn cancelling_a_response_body_is_clean() {
+    local_cancellation(true).await;
+}
+
+#[tokio::test]
+async fn a_public_connection_takes_the_original_error_without_executor_duplicate() {
+    let (executor, mut results) = Recording::new();
+    let (sender, connection) =
+        hyper::client::conn::http2::handshake::<_, _, Empty<Bytes>>(executor.clone(), BrokenIo)
+            .await
+            .unwrap();
+    let error = connection.await.unwrap_err();
+    assert!(format!("{error:?}").contains("h2-connection-marker"));
+    drop(sender);
+    executor.join().await;
+    while let Ok(result) = results.try_recv() {
+        assert!(result.is_ok(), "duplicate: {result:?}");
+    }
+}
+struct SignalledIo(Option<oneshot::Sender<()>>);
+impl hyper::rt::Read for SignalledIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        if let Some(read) = self.0.take() {
+            read.send(()).unwrap();
+        }
+        Pin::new(&mut BrokenIo).poll_read(cx, buf)
+    }
+}
+impl hyper::rt::Write for SignalledIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut BrokenIo).poll_write(cx, bytes)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut BrokenIo).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut BrokenIo).poll_shutdown(cx)
+    }
+}
+#[tokio::test]
+async fn dropping_the_public_connection_after_failure_leaves_its_error_to_the_executor() {
+    let (executor, mut results) = Recording::new();
+    let (read, failure_read) = oneshot::channel();
+    let (sender, connection) = hyper::client::conn::http2::handshake::<_, _, Empty<Bytes>>(
+        executor.clone(),
+        SignalledIo(Some(read)),
+    )
+    .await
+    .unwrap();
+    failure_read.await.unwrap();
+    drop(connection);
+    let error = next(&mut results).await.unwrap_err();
+    assert!(format!("{error:?}").contains("h2-connection-marker"));
+    drop(sender);
+    executor.join().await;
+    while let Ok(result) = results.try_recv() {
+        assert!(result.is_ok(), "duplicate: {result:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_connection_failure_during_an_upload_is_reported_once() {
+    let (executor, mut results) = Recording::new();
+    let (io, peer) = tokio::io::duplex(4096);
+    let (fail, failing) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut connection = h2::server::handshake(peer).await.unwrap();
+        let (request, mut response) = connection.accept().await.unwrap().unwrap();
+        let upload = response
+            .send_response(http::Response::new(()), true)
+            .unwrap();
+        let driver = tokio::spawn(async move { while connection.accept().await.is_some() {} });
+        failing.await.unwrap();
+        driver.abort();
+        assert!(driver.await.unwrap_err().is_cancelled());
+        drop((request, upload));
+    });
+    let (mut sender, connection) =
+        hyper::client::conn::http2::handshake(executor.clone(), TokioIo::new(io))
+            .await
+            .unwrap();
+    executor.execute(connection);
+    let (_frames, frames) = futures_channel::mpsc::unbounded::<Result<Frame<Bytes>, io::Error>>();
+    let response = sender
+        .send_request(
+            Request::post("https://fixture.test/")
+                .body(http_body_util::StreamBody::new(frames))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.body().is_end_stream());
+    fail.send(()).unwrap();
+    let mut errors = Vec::new();
+    loop {
+        if let Err(error) = next(&mut results).await {
+            let connection = error.to_string() == "connection error";
+            errors.push(error);
+            if connection {
+                break;
+            }
+        }
+    }
+    assert_eq!(response.status(), 200);
+    drop(response);
+    drop(sender);
+    executor.join().await;
+    server.await.unwrap();
+    while let Ok(result) = results.try_recv() {
+        if let Err(error) = result {
+            errors.push(error);
+        }
+    }
+    assert_eq!(errors.len(), 1, "{errors:?}");
 }

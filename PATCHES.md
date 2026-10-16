@@ -40,7 +40,8 @@ eagerly completed pipe is submitted as a completed result through the same
 `H2ClientFuture` handoff. The executor traits keep their methods and generic
 shape; generic Tokio executors continue to work. Request response tasks return
 Ok once their callback accepts an error, and retain an undelivered error for
-the executor if that callback is already cancelled. Responses are unchanged.
+the executor if that callback is already cancelled, except for ordinary local
+cancellation. Responses are unchanged.
 
 `cargo test --features full --test task_results` passes four regressions
 (exit 0) on macOS arm64: the underlying connection error, synchronous and
@@ -53,3 +54,49 @@ implementation (exit 101), and pass with the patch (exit 0).
 blocked by exactly the baseline's diagnostic messages: two in the library
 lane and the existing all-target test diagnostics (exit 101). No suppression
 or unrelated repair is included.
+
+## Ordinary background ends (issue #63 regression)
+
+A background result means failed work only when the task's purpose failed.
+The client upload adapter's `upload_result` is shared by eager and pending
+pipes: a peer's NO_ERROR stop is ordinary early-response upload termination,
+as the upstream Incoming body already treats that reason. Other resets and
+user-body errors retain their original error. The test distinguishes a
+NO_ERROR coming from a user body from the upload pipe's own stop.
+`Callback::send_result` retains genuine undelivered errors but maps local
+cancellation to Ok; the h2 check uses the error kind and reset initiator,
+never a reset string or every CANCEL.
+
+Regression evidence: `tests/task_results.rs` checks a complete response
+followed by NO_ERROR, INTERNAL_ERROR retained once, and local cancellation
+before headers and after headers. The callback unit regression covers both
+retry and non-retry callbacks, cancellation and a genuine undelivered body
+failure. Existing connection, eager/pending user-body and once-only request
+delivery regressions remain. `cargo test -p hyper --features full --locked`
+passes on macOS arm64 with the matching hyper-util test workspace.
+
+The h2 connection's internal task and public dispatcher also share one error
+slot. `ClientTask::finish_connection` takes the original failure for the public
+connection, or releases it to the internal task when the dispatcher is dropped;
+the internal task completes Ok after that delivery. This preserves the public
+connection's original error without reporting it twice to one executor.
+`task_results` checks a driven public connection, direct error delivery without
+an executor duplicate, and an observer leaving after the original I/O failure
+was published. It never treats dropping an unfailed connection as failure.
+
+An upload can also inherit the connection's h2 I/O/GOAWAY error before the
+public dispatcher has consumed it. The client-only upload checkpoint leaves
+that connection end to the separately owned connection handoff. It matches
+BodyWrite plus a direct h2 connection-error variant, not EOF text, every I/O
+cause, or stream resets; user-body I/O and independent reset failures remain.
+The pending-upload/failed-connection regression reproduces two diagnostics
+before this ownership correction and one afterward, retaining the real
+connection error and the already complete response.
+
+The cancelled-observer response handoff applies the same ownership distinction:
+`response_task_result` leaves an h2 connection I/O/GOAWAY error to the connection
+handoff, while keeping a genuine undelivered stream/request error. The private
+ResponseFutMap context and Error kind distinguish that error from a user body's
+own I/O error; the generic executor has no EOF/reset filter. Its unit regression
+covers connection, REFUSED_STREAM and user-body I/O outcomes. Boundless's gRPC
+peer-loss regression requires the one original-code/cause warning after close.

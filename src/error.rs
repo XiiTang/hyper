@@ -336,6 +336,66 @@ impl Error {
         &self.inner.kind
     }
 
+    #[cfg(all(feature = "client", feature = "http2"))]
+    pub(crate) fn is_upload_stop(&self) -> bool {
+        matches!(self.inner.kind, Kind::BodyWrite)
+            && self
+                .inner
+                .cause
+                .as_ref()
+                .and_then(|cause| cause.downcast_ref::<h2::Error>())
+                .map_or(false, |error| error.reason() == Some(h2::Reason::NO_ERROR))
+    }
+
+    // A failed connection can wake every upload with the same I/O/GOAWAY
+    // error. The client pipe leaves this inherited end to its separately
+    // owned connection task, which retains the original failure. A user
+    // body's own I/O error has User(Body) kind, never this BodyWrite shape.
+    #[cfg(all(feature = "client", feature = "http2"))]
+    pub(crate) fn is_connection_failure_in_upload(&self) -> bool {
+        matches!(self.inner.kind, Kind::BodyWrite)
+            && self
+                .inner
+                .cause
+                .as_ref()
+                .and_then(|cause| cause.downcast_ref::<h2::Error>())
+                .map_or(false, |error| error.is_io() || error.is_go_away())
+    }
+
+    // ResponseFutMap creates Io only from its h2 connection's I/O error;
+    // user/body/guard errors have a different kind. GOAWAY and the native
+    // keepalive timeout are likewise the separately owned connection's end,
+    // rather than a stream reset or an independent request failure.
+    #[cfg(all(feature = "client", feature = "http2"))]
+    pub(crate) fn is_connection_failure_in_response(&self) -> bool {
+        matches!(self.inner.kind, Kind::Io)
+            || (matches!(self.inner.kind, Kind::Http2)
+                && (self.is_timeout()
+                    || self
+                        .inner
+                        .cause
+                        .as_ref()
+                        .and_then(|cause| cause.downcast_ref::<h2::Error>())
+                        .map_or(false, |error| error.is_go_away())))
+    }
+
+    #[cfg(all(feature = "client", feature = "http2"))]
+    pub(crate) fn is_local_cancel(&self) -> bool {
+        self.is_canceled()
+            || (matches!(self.inner.kind, Kind::Http2)
+                && self
+                    .inner
+                    .cause
+                    .as_ref()
+                    .and_then(|cause| cause.downcast_ref::<h2::Error>())
+                    .map_or(false, |error| {
+                        error.is_reset()
+                            && !error.is_remote()
+                            && !error.is_library()
+                            && error.reason() == Some(h2::Reason::CANCEL)
+                    }))
+    }
+
     pub(crate) fn find_source<E: StdError + 'static>(&self) -> Option<&E> {
         let mut cause = self.source();
         while let Some(err) = cause {

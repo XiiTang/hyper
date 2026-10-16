@@ -3,6 +3,7 @@ use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::Duration,
 };
@@ -172,6 +173,8 @@ where
     // parked Connection.
     let (conn_drop_ref, conn_drop_rx) = mpsc::channel(1);
     let (cancel_tx, conn_eof) = oneshot::channel();
+    let error = Arc::new(Mutex::new(ConnectionError::default()));
+    let (error_release, released) = oneshot::channel();
 
     let ping_config = new_ping_config(config);
 
@@ -190,13 +193,15 @@ where
     };
 
     exec.execute_h2_future(H2ClientFuture::Task {
-        task: ConnTask::new(conn, conn_drop_rx, cancel_tx),
+        task: ConnTask::new(conn, conn_drop_rx, cancel_tx, error.clone(), released),
     });
 
     Ok(ClientTask {
         ping,
         conn_drop_ref,
         conn_eof,
+        error,
+        error_release: Some(error_release),
         executor: exec,
         h2_tx,
         req_rx,
@@ -298,6 +303,15 @@ where
     }
 }
 
+// The public connection dispatcher either returns this failure or releases
+// it to the background connection task. Readiness is a second observation
+// of the same connection end, not another failed task.
+#[derive(Default)]
+struct ConnectionError {
+    error: Option<crate::Error>,
+    claimed: bool,
+}
+
 pin_project! {
     pub struct ConnTask<T, B>
     where
@@ -312,6 +326,9 @@ pin_project! {
         cancel_tx: Option<oneshot::Sender<Infallible>>,
         #[pin]
         conn: ConnMapErr<T, B>,
+        error: Arc<Mutex<ConnectionError>>,
+        #[pin]
+        released: oneshot::Receiver<()>,
     }
 }
 
@@ -324,11 +341,15 @@ where
         conn: ConnMapErr<T, B>,
         drop_rx: Receiver<Infallible>,
         cancel_tx: oneshot::Sender<Infallible>,
+        error: Arc<Mutex<ConnectionError>>,
+        released: oneshot::Receiver<()>,
     ) -> Self {
         Self {
             drop_rx,
             cancel_tx: Some(cancel_tx),
             conn,
+            error,
+            released,
         }
     }
 }
@@ -345,8 +366,25 @@ where
 
         if !this.conn.is_terminated() {
             if let Poll::Ready(result) = Pin::new(&mut this.conn).poll(cx) {
-                return Poll::Ready(result);
+                match result {
+                    Ok(()) => return Poll::Ready(Ok(())),
+                    Err(error) => {
+                        let mut state = this.error.lock().unwrap();
+                        if state.claimed {
+                            return Poll::Ready(Ok(()));
+                        }
+                        state.error = Some(error);
+                        // Wake the public dispatcher even when it waits only
+                        // for requests. It takes the original error or drops
+                        // its release sender, leaving this task the owner.
+                        drop(this.cancel_tx.take());
+                    }
+                }
             }
+        }
+        if this.conn.is_terminated() {
+            let _ = ready!(this.released.poll(cx));
+            return Poll::Ready(this.error.lock().unwrap().error.take().map_or(Ok(()), Err));
         }
 
         if !this.drop_rx.is_terminated() && Pin::new(&mut this.drop_rx).poll_next(cx).is_ready() {
@@ -435,6 +473,8 @@ where
     ping: ping::Recorder,
     conn_drop_ref: ConnDropRef,
     conn_eof: ConnEof,
+    error: Arc<Mutex<ConnectionError>>,
+    error_release: Option<oneshot::Sender<()>>,
     executor: E,
     h2_tx: SendRequest<SendBuf<B::Data>>,
     req_rx: ClientRx<B>,
@@ -449,6 +489,26 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     T: Read + Write + Unpin,
 {
+    fn finish_connection(
+        &mut self,
+        result: crate::Result<Dispatched>,
+    ) -> crate::Result<Dispatched> {
+        let mut state = self.error.lock().unwrap();
+        let result = match (state.error.take(), result) {
+            (Some(error), _) => {
+                state.claimed = true;
+                Err(error)
+            }
+            (None, Err(error)) => {
+                state.claimed = true;
+                Err(error)
+            }
+            (None, result) => result,
+        };
+        self.error_release.take();
+        result
+    }
+
     pub(crate) fn is_extended_connect_protocol_enabled(&self) -> bool {
         self.h2_tx.is_extended_connect_protocol_enabled()
     }
@@ -472,6 +532,19 @@ pin_project! {
         #[pin]
         ping: Option<Recorder>,
         cancel_rx: Option<oneshot::Receiver<()>>,
+    }
+}
+
+// RFC 9113 section 8.1: a server may stop an upload with NO_ERROR
+// after its response. Incoming handles the response independently; the
+// upload task has completed its purpose. h2 also copies a failed connection's
+// I/O/GOAWAY error into every stream. The connection handoff above owns that
+// one original failure; it is not another upload failure. User-body errors
+// and independent stream resets remain errors. This rule is client-only.
+fn upload_result(result: crate::Result<()>) -> crate::Result<()> {
+    match result {
+        Err(error) if error.is_upload_stop() || error.is_connection_failure_in_upload() => Ok(()),
+        result => result,
     }
 }
 
@@ -509,7 +582,7 @@ where
             Poll::Ready(result) => {
                 drop(this.conn_drop_ref.take().expect("Future polled twice"));
                 drop(this.ping.take().expect("Future polled twice"));
-                return Poll::Ready(result);
+                return Poll::Ready(upload_result(result));
             }
             Poll::Pending => (),
         }
@@ -541,7 +614,7 @@ where
                 match Pin::new(&mut pipe).poll(cx) {
                     Poll::Ready(result) => {
                         self.executor.execute_h2_future(H2ClientFuture::Ready {
-                            result: Some(result),
+                            result: Some(upload_result(result)),
                         });
                     }
                     Poll::Pending => {
@@ -606,6 +679,16 @@ impl<B: Body + 'static, E> ResponseFutMap<B, E> {
         if let Some(cancel_tx) = self.project().cancel_tx.take() {
             let _ = cancel_tx.send(());
         }
+    }
+}
+
+// An observer that left can leave a genuine stream/request error here,
+// but the same connection failure is already owned by the connection
+// handoff. Keep that once, even when h2 wakes the response task first.
+pub(crate) fn response_task_result(result: crate::Result<()>) -> crate::Result<()> {
+    match result {
+        Err(error) if error.is_connection_failure_in_response() => Ok(()),
+        result => result,
     }
 }
 
@@ -689,13 +772,15 @@ where
             match ready!(self.h2_tx.poll_ready(cx)) {
                 Ok(()) => (),
                 Err(err) => {
-                    self.ping.ensure_not_timed_out()?;
-                    return if err.reason() == Some(::h2::Reason::NO_ERROR) {
-                        trace!("connection gracefully shutdown");
-                        Poll::Ready(Ok(Dispatched::Shutdown))
-                    } else {
-                        Poll::Ready(Err(crate::Error::new_h2(err)))
+                    let result = match self.ping.ensure_not_timed_out() {
+                        Err(error) => Err(error),
+                        Ok(()) if err.reason() == Some(::h2::Reason::NO_ERROR) => {
+                            trace!("connection gracefully shutdown");
+                            Ok(Dispatched::Shutdown)
+                        }
+                        Ok(()) => Err(crate::Error::new_h2(err)),
                     };
+                    return Poll::Ready(self.finish_connection(result));
                 }
             }
 
@@ -794,7 +879,7 @@ where
 
                 Poll::Ready(None) => {
                     trace!("client::dispatch::Sender dropped");
-                    return Poll::Ready(Ok(Dispatched::Shutdown));
+                    return Poll::Ready(self.finish_connection(Ok(Dispatched::Shutdown)));
                 }
 
                 Poll::Pending => match ready!(Pin::new(&mut self.conn_eof).poll(cx)) {
@@ -804,10 +889,45 @@ where
                     Ok(never) => match never {},
                     Err(_conn_is_eof) => {
                         trace!("connection task is closed, closing dispatch task");
-                        return Poll::Ready(Ok(Dispatched::Shutdown));
+                        return Poll::Ready(self.finish_connection(Ok(Dispatched::Shutdown)));
                     }
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod upload_result_tests {
+    #[test]
+    fn an_undelivered_response_keeps_its_request_failure_and_leaves_connection_failure_to_its_owner(
+    ) {
+        let connection = crate::Error::new_io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "connection-marker",
+        ));
+        assert!(super::response_task_result(Err(connection)).is_ok());
+        assert!(
+            super::response_task_result(Err(super::ping::KeepAliveTimedOut.crate_error())).is_ok()
+        );
+        let stream = crate::Error::new_h2(h2::Reason::REFUSED_STREAM.into());
+        assert!(super::response_task_result(Err(stream)).is_err());
+        let body = crate::Error::new_user_body(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "body-marker",
+        ));
+        assert!(super::response_task_result(Err(body)).is_err());
+    }
+
+    #[test]
+    fn an_upload_stop_is_not_a_user_body_error() {
+        let stop = h2::Error::from(h2::Reason::NO_ERROR);
+        assert!(super::upload_result(Err(crate::Error::new_body_write(stop))).is_ok());
+        let user = h2::Error::from(h2::Reason::NO_ERROR);
+        assert!(super::upload_result(Err(crate::Error::new_user_body(user))).is_err());
+        let own_io = std::io::Error::new(std::io::ErrorKind::Other, "upload-own-io-failure");
+        assert!(super::upload_result(Err(crate::Error::new_user_body(own_io))).is_err());
+        let reset = h2::Error::from(h2::Reason::CANCEL);
+        assert!(super::upload_result(Err(crate::Error::new_body_write(reset))).is_err());
     }
 }

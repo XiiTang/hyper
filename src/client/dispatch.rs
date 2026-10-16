@@ -263,6 +263,18 @@ fn dispatch_gone() -> crate::Error {
     })
 }
 
+fn undelivered(error: crate::Error) -> crate::Result<()> {
+    #[cfg(feature = "http2")]
+    if error.is_local_cancel() {
+        return Ok(());
+    }
+    #[cfg(not(feature = "http2"))]
+    if error.is_canceled() {
+        return Ok(());
+    }
+    Err(error)
+}
+
 impl<T, U> Callback<T, U> {
     #[cfg(feature = "http2")]
     pub(crate) fn is_canceled(&self) -> bool {
@@ -294,7 +306,7 @@ impl<T, U> Callback<T, U> {
                     .expect("callback sender not dropped before send")
                     .send(val)
                 {
-                    Err(Err(error)) => Err(error.error),
+                    Err(Err(error)) => undelivered(error.error),
                     _ => Ok(()),
                 }
             }
@@ -304,7 +316,7 @@ impl<T, U> Callback<T, U> {
                     .expect("callback sender not dropped before send")
                     .send(val.map_err(|e| e.error))
                 {
-                    Err(Err(error)) => Err(error),
+                    Err(Err(error)) => undelivered(error),
                     _ => Ok(()),
                 }
             }
@@ -388,7 +400,8 @@ where
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err((error, message))) => {
-                Poll::Ready(call_back.send_result(Err(TrySendError { error, message })))
+                let result = call_back.send_result(Err(TrySendError { error, message }));
+                Poll::Ready(crate::proto::h2::client::response_task_result(result))
             }
         }
     }
@@ -404,6 +417,39 @@ mod tests {
     use std::task::{Context, Poll};
 
     use super::{channel, Callback, Receiver};
+
+    #[test]
+    fn a_cancelled_callback_keeps_only_genuine_undelivered_errors() {
+        for retry in [false, true] {
+            for cancelled in [false, true] {
+                let callback: Callback<(), ()> = if retry {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    drop(rx);
+                    Callback::Retry(Some(tx))
+                } else {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    drop(rx);
+                    Callback::NoRetry(Some(tx))
+                };
+                let error = if cancelled {
+                    crate::Error::new_canceled()
+                } else {
+                    crate::Error::new_user_body("undelivered-body-marker")
+                };
+                let result = callback.send_result(Err(super::TrySendError {
+                    error,
+                    message: None,
+                }));
+                if cancelled {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(
+                        format!("{:?}", result.unwrap_err()).contains("undelivered-body-marker")
+                    );
+                }
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct Custom(#[allow(dead_code)] i32);
