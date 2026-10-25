@@ -31,3 +31,38 @@ and, dropped before its end, tells the pipe to reset the stream with CANCEL.
 Regression evidence: `tests/client.rs`
 `h2_pipe_task_cancelled_on_response_body_drop` fails without the change and
 passes with it; `cargo test --features full` passes on macOS arm64.
+
+## A request handed to h2 takes its own stream's result (Boundless #354, driver plan v23 Rule 8)
+
+At e158e802, as on upstream master c954d80c, the HTTP/2 client dispatcher
+checks `SendRequest::poll_ready` again right after `send_request` has created
+a request's stream (`src/proto/h2/client.rs:768-786`). On an error it answers
+the request with that connection error, `message: None`, and drops the
+stream. A request kept while its stream is pending open is dropped unpiped
+when the loop's top readiness check returns (`:682-700`), so it ends
+`DispatchGone`. h2 reports the connection's error first (`streams.rs:1075`
+at h2 7b547e04), and a graceful GOAWAY sets that error for every stream
+although it fails only the streams above its last stream id
+(`streams.rs:800-816`). A stream the GOAWAY counts, whose HEADERS may have
+been sent and processed, thus took a remote NO_ERROR GOAWAY, the fact that
+marks a request as unprocessed and lets a caller resend it, or lost its
+result. grpc-node attributes in the same way as this patch: a created
+stream's status comes from its own close (`subchannel-call.ts:240-300`),
+never from the session's `goaway` (`transport.ts:205-227`).
+
+The dispatcher now checks readiness only at its loop's top. A request handed
+to h2 is kept in `fut_ctx` until that check is ready or failed, and is then
+piped whatever the result, so it takes its own stream's result: a counted
+stream its response, a stream above the last stream id h2's GOAWAY error.
+`FutCtx` is created only into `fut_ctx`, which is taken only there.
+
+Regression evidence: the `proto::h2::client::tests` unit tests
+`counted_stream_keeps_its_result_when_goaway_precedes_the_readiness_check`
+and `counted_stream_keeps_its_result_when_goaway_arrives_while_it_waits_to_open`.
+An h2 server sends a graceful GOAWAY that counts the stream and acknowledges
+when the client has read it. The first holds the dispatcher, on its own
+thread, between `send_request` and the readiness check until then, through a
+`#[cfg(test)]` thread-local hook: nothing else runs in that window. The
+second polls the dispatcher itself, with `initial_max_send_streams(1)`.
+Without the change they fail (exit 101) with `GoAway(NO_ERROR, Remote)` and
+`DispatchGone`; with it they pass (exit 0).

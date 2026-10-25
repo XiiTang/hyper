@@ -680,7 +680,18 @@ where
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
-            match ready!(self.h2_tx.poll_ready(cx)) {
+            // The dispatcher's one readiness check. A request handed to h2
+            // waits here while its stream is pending open, and then takes its
+            // own stream's result whatever the connection's readiness: a
+            // graceful GOAWAY may count the stream, and the peer process it.
+            let ready = ready!(self.h2_tx.poll_ready(cx));
+            if let Some(f) = self.fut_ctx.take() {
+                self.poll_pipe(f, cx);
+                if ready.is_ok() {
+                    continue;
+                }
+            }
+            match ready {
                 Ok(()) => (),
                 Err(err) => {
                     self.ping.ensure_not_timed_out()?;
@@ -691,13 +702,6 @@ where
                         Poll::Ready(Err(crate::Error::new_h2(err)))
                     };
                 }
-            }
-
-            // If we were waiting on pending open
-            // continue where we left off.
-            if let Some(f) = self.fut_ctx.take() {
-                self.poll_pipe(f, cx);
-                continue;
             }
 
             match self.req_rx.poll_recv(cx) {
@@ -765,25 +769,17 @@ where
                         cb,
                     };
 
-                    // Check poll_ready() again.
+                    #[cfg(test)]
+                    tests::AFTER_SEND_REQUEST.with(|hook| {
+                        if let Some(hook) = hook.borrow_mut().as_mut() {
+                            hook();
+                        }
+                    });
+
+                    // Check poll_ready() again, at the loop's top.
                     // If the call to send_request() resulted in the new stream being pending open
                     // we have to wait for the open to complete before accepting new requests.
-                    match self.h2_tx.poll_ready(cx) {
-                        Poll::Pending => {
-                            // Save Context
-                            self.fut_ctx = Some(f);
-                            return Poll::Pending;
-                        }
-                        Poll::Ready(Ok(())) => (),
-                        Poll::Ready(Err(err)) => {
-                            f.cb.send(Err(TrySendError {
-                                error: crate::Error::new_h2(err),
-                                message: None,
-                            }));
-                            continue;
-                        }
-                    }
-                    self.poll_pipe(f, cx);
+                    self.fut_ctx = Some(f);
                 }
 
                 Poll::Ready(None) => {
@@ -803,5 +799,139 @@ where
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::task::Poll;
+
+    use bytes::Bytes;
+    use http_body_util::Empty;
+
+    use crate::client::conn::http2::Builder;
+    use crate::common::io::Compat;
+
+    thread_local! {
+        /// Runs on the dispatcher's thread after `send_request` hands a
+        /// request to h2 and before the dispatcher next checks the
+        /// connection's readiness. Nothing outside the dispatcher runs in
+        /// that window, so a test fixes such a schedule only through it.
+        pub(super) static AFTER_SEND_REQUEST: RefCell<Option<Box<dyn FnMut()>>> =
+            const { RefCell::new(None) };
+    }
+
+    #[derive(Clone)]
+    struct HandleExecutor(tokio::runtime::Handle);
+
+    impl<F> crate::rt::Executor<F> for HandleExecutor
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        fn execute(&self, future: F) {
+            self.0.spawn(future);
+        }
+    }
+
+    fn request() -> http::Request<Empty<Bytes>> {
+        http::Request::builder()
+            .uri("http://fixture.test/")
+            .body(Empty::new())
+            .unwrap()
+    }
+
+    /// Answers the connection's only stream after a graceful GOAWAY that
+    /// counts it; `counted` runs once the client has read that GOAWAY.
+    async fn serve_counted_stream(io: tokio::io::DuplexStream, counted: impl FnOnce()) {
+        let mut connection = h2::server::handshake(io).await.unwrap();
+        let (_, mut respond) = connection.accept().await.unwrap().unwrap();
+        // GOAWAY(NO_ERROR) with last stream id 2^31-1 and then, once the
+        // client acknowledges the PING sent with it, with this stream's id.
+        connection.graceful_shutdown();
+        let mut ping_pong = connection.ping_pong().unwrap();
+        let driver = tokio::spawn(async move {
+            if let Some(Ok(_)) = connection.accept().await {
+                panic!("unexpected second stream");
+            }
+        });
+        // h2 sends this PING after the GOAWAYs, and the client acknowledges
+        // it after reading them.
+        ping_pong.ping(h2::Ping::opaque()).await.unwrap();
+        counted();
+        // Fails when the client has given the stream up.
+        let _ = respond.send_response(http::Response::new(()), true);
+        driver.await.unwrap();
+    }
+
+    /// The connection reads a graceful GOAWAY that counts a request's stream
+    /// between `send_request` and the dispatcher's next readiness check: the
+    /// request takes its stream's response, not the connection's error.
+    #[tokio::test]
+    async fn counted_stream_keeps_its_result_when_goaway_precedes_the_readiness_check() {
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let (counted_tx, counted_rx) = std::sync::mpsc::channel();
+        let server = tokio::spawn(serve_counted_stream(server_io, move || {
+            counted_tx.send(()).unwrap();
+        }));
+        let (mut sender, connection) =
+            Builder::new(HandleExecutor(tokio::runtime::Handle::current()))
+                .handshake::<_, Empty<Bytes>>(Compat::new(client_io))
+                .await
+                .unwrap();
+        let response = sender.send_request(request());
+        // The dispatcher runs on its own thread and is held after
+        // `send_request` until the client has read the GOAWAY; the h2
+        // connection and the server run on this one.
+        let dispatcher = std::thread::spawn(move || {
+            AFTER_SEND_REQUEST.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || counted_rx.recv().unwrap()));
+            });
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(connection)
+        });
+        let response = response.await.expect("the counted stream's own result");
+        assert_eq!(response.status(), 200);
+        server.await.unwrap();
+        tokio::task::spawn_blocking(move || dispatcher.join().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A request whose stream waits to open is kept by the dispatcher; when
+    /// the connection reads a graceful GOAWAY that counts the stream before
+    /// the dispatcher runs again, the request takes its stream's response.
+    #[tokio::test]
+    async fn counted_stream_keeps_its_result_when_goaway_arrives_while_it_waits_to_open() {
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let (counted_tx, counted_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_counted_stream(server_io, move || {
+            counted_tx.send(()).unwrap();
+        }));
+        let (mut sender, connection) =
+            Builder::new(HandleExecutor(tokio::runtime::Handle::current()))
+                // A new stream reaches this limit and waits to open.
+                .initial_max_send_streams(1)
+                .handshake::<_, Empty<Bytes>>(Compat::new(client_io))
+                .await
+                .unwrap();
+        let response = sender.send_request(request());
+        let mut connection = Box::pin(connection);
+        // One dispatcher poll hands the request to h2 and keeps it while its
+        // stream waits to open.
+        let first = futures_util::future::poll_fn(|cx| Poll::Ready(connection.as_mut().poll(cx)));
+        assert!(first.await.is_pending());
+        // The h2 connection opens the stream and reads the GOAWAY before the
+        // dispatcher runs again.
+        counted_rx.await.unwrap();
+        connection.await.unwrap();
+        let response = response.await.expect("the counted stream's own result");
+        assert_eq!(response.status(), 200);
+        server.await.unwrap();
     }
 }
