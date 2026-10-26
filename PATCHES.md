@@ -140,3 +140,34 @@ full SHA. The approved mechanical departure uses this same full SHA for
 `--precise` and `patch.crates-io.h2.rev`; Cargo interprets a git-patched
 `--precise` as a revision, so `--precise 0.4.19` is not runnable. No h2 commit
 followed this verification.
+
+
+## W5d fix8 readiness retention — WIP, blocked before native regressions
+
+The native readiness error must be retained before dispatcher destruction, at
+ClientTask::poll's existing h2 readiness Err branch after the ping-timeout guard.
+The reviewed CloseReason latch has one private first writer and the public
+SendRequest closed-readiness path is its sole reader; cloned senders share the
+fixed association. No request scheduling, counted-stream result handling,
+HTTP/1 path, timeout precedence or public signatures change.
+
+Source committed as da4b62d0 (descendant of 93775f0), macOS arm64. Exact fix8
+representation Arc<Mutex<Option<h2::Error>>> requires cloning h2::Error in both
+remember and error. Pinned h2 ba6b4e6e89849c480c7b1c5312aff539d0f1b658 does not
+implement Clone (its private Kind includes io::Error). The required new native
+regression http2_poll_ready_retains_received_goaway therefore does not run:
+`build-slot cargo --config 'patch.crates-io.h2.git="https://github.com/XiiTang/h2"' --config 'patch.crates-io.h2.rev="ba6b4e6e89849c480c7b1c5312aff539d0f1b658"' test --features full --test client http2_poll_ready_retains_received_goaway --locked`
+exits 101 with E0599 at src/proto/h2/client.rs:43 (Option<h2::Error>: Clone
+unsatisfied) and E0308 at :49 (expected h2::Error, found &h2::Error).
+The real stream1/accepted-frame fixture includes nonzero and NO_ERROR GOAWAY,
+cloned-sender readiness and no-received-frame local-drop controls; its assertions
+are unverified until this compile blocker is resolved. No drive-error substitute,
+error reconstruction, h2 patch or alternative representation has been invented.
+This WIP tip must not replace the last buildable Boundless pin before review.
+
+The same two h2 overrides were used for `build-slot cargo ... fmt --all`, exit 0.
+Its unrelated src/ext/mod.rs baseline formatting change was restored. Existing
+baseline fmt/Clippy exclusions and previous native regression results above remain
+historical evidence, not a passing gate for this WIP. Required counted-stream,
+capture-survives-Ok, client/lib and strict checks remain blocked by compilation.
+No h2, lapin, fork boundless branch or Boundless dependency pin changed in fix8.
