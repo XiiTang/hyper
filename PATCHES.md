@@ -98,3 +98,14 @@ No registry-only or path-override run counts as evidence. The isolated test
 Cargo.lock is not committed. Existing ignored tests remain the five
 client::conn::http2 executor send/sync compile checks and
 proto::h1::io::tests::iobuf_write_empty_slice.
+
+Pinned-tree formatting correction: a later clean-tree audit found that the
+previous fmt pass included an unstaged formatter-only change to src/ext/mod.rs.
+That unrelated change has been restored to the pinned source. On code tip
+31c22edacb4895e400bf8e45f23617f5f1576a52, the required fmt --all --check with both
+h2 overrides exits 1: the current rustfmt reorders informational re-exports at
+lines 57-65. The same lines are unchanged from base 60bb53e5, so this is a
+baseline formatting mismatch, not W5d behavior. The earlier fmt pass is not a
+pass for the pinned tree. No out-of-scope formatting repair is included.
+The GOAWAY/client/lib results above remain code evidence; h2 stays exactly
+db341210890d8e95381c13b49b8356c43da552a4. This evidence correction changes no Rust.
