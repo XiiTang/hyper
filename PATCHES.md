@@ -171,3 +171,10 @@ baseline fmt/Clippy exclusions and previous native regression results above rema
 historical evidence, not a passing gate for this WIP. Required counted-stream,
 capture-survives-Ok, client/lib and strict checks remain blocked by compilation.
 No h2, lapin, fork boundless branch or Boundless dependency pin changed in fix8.
+
+Follow-up source audit at 1eb6ee97, macOS arm64: `build-slot cargo --config 'patch.crates-io.h2.git="https://github.com/XiiTang/h2"' --config 'patch.crates-io.h2.rev="ba6b4e6e89849c480c7b1c5312aff539d0f1b658"' fmt --all --check`
+exits 1 only for unchanged src/ext/mod.rs:57-65. With the same two overrides,
+`metadata --features full --format-version 1 --locked` exits 0. Independent
+metadata and lock inspection exits 0: one h2 0.4.19 at that full SHA. These
+checks do not resolve the h2::Error Clone compile blocker or count as native
+readiness regression passes. Boundless remains on its last buildable hyper pin.
