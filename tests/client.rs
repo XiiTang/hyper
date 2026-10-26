@@ -3408,3 +3408,80 @@ where
         )
     }
 }
+
+#[tokio::test]
+async fn http2_graceful_goaway_capture_survives_ok() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (io, mut peer) = tokio::io::duplex(4096);
+    let capture = h2::GoAwayCapture::default();
+    let (go, sent) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut preface = [0; 24];
+        peer.read_exact(&mut preface).await.unwrap();
+        assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        peer.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await.unwrap();
+        loop {
+            let mut head = [0; 9];
+            peer.read_exact(&mut head).await.unwrap();
+            let len = ((head[0] as usize) << 16) | ((head[1] as usize) << 8) | head[2] as usize;
+            let mut payload = vec![0; len];
+            peer.read_exact(&mut payload).await.unwrap();
+            if head[3] == 4 && head[4] == 0 {
+                peer.write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0]).await.unwrap();
+            }
+            if head[3] == 1 {
+                assert_eq!(&head[5..], &[0, 0, 0, 1]);
+                break;
+            }
+        }
+        peer.write_all(&[0, 0, 1, 1, 5, 0, 0, 0, 1, 0x88])
+            .await
+            .unwrap();
+        sent.await.unwrap();
+        let mut goaway = vec![0, 0, 15, 7, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        goaway.extend_from_slice(b"\x00\xffdrain");
+        peer.write_all(&goaway).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let mut byte = [0; 256];
+        while peer.read(&mut byte).await.unwrap() != 0 {}
+    });
+    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(support::TokioExecutor)
+        .received_go_away(capture.clone())
+        .handshake::<_, http_body_util::Empty<Bytes>>(TokioIo::new(io))
+        .await
+        .unwrap();
+    let drive = tokio::spawn(connection);
+    let response = sender
+        .send_request(
+            Request::builder()
+                .uri("https://example.com/")
+                .body(http_body_util::Empty::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.into_body().collect().await.unwrap();
+    go.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while capture.received().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(sender);
+    tokio::time::timeout(Duration::from_secs(10), drive)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let received = capture.received().unwrap();
+    assert_eq!(received.last_stream_id().as_u32(), 1);
+    assert_eq!(received.reason(), h2::Reason::NO_ERROR);
+    assert_eq!(received.debug_data(), b"\x00\xffdrain");
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap();
+}

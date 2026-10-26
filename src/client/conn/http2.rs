@@ -314,6 +314,14 @@ where
         }
     }
 
+    /// Retain the first accepted peer GOAWAY even when this connection drains Ok.
+    /// Panics if a capture has already been configured.
+    pub fn received_go_away(&mut self, capture: h2::GoAwayCapture) -> &mut Self {
+        assert!(self.h2_builder.received_go_away.is_none(), "configure GOAWAY capture once");
+        self.h2_builder.received_go_away = Some(capture);
+        self
+    }
+
     /// Provide a timer to execute background HTTP2 tasks.
     pub fn timer<M>(&mut self, timer: M) -> &mut Builder<Ex>
     where
