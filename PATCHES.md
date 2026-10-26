@@ -79,12 +79,12 @@ macOS arm64 regression evidence, code tip
 2f5d27ae5916ff419b79e6c8c62cfd4d2c85f0cb, features `full`:
 all Cargo commands below use both overrides:
 `--config 'patch.crates-io.h2.git="https://github.com/XiiTang/h2"'`
-and `--config 'patch.crates-io.h2.rev="e4297516c0e6cd13b5a8e3c5ef41cbc4bc843e41"'`.
+and `--config 'patch.crates-io.h2.rev="ba6b4e6e89849c480c7b1c5312aff539d0f1b658"'`.
 
-- `cargo <overrides> update -p h2 --precise e4297516c0e6cd13b5a8e3c5ef41cbc4bc843e41`: exit 0.
+- `cargo <overrides> update -p h2 --precise ba6b4e6e89849c480c7b1c5312aff539d0f1b658`: exit 0.
 - `cargo <overrides> metadata --features full --format-version 1 --locked`: exit 0.
   Metadata and Cargo.lock each contain one h2 package, version 0.4.19, git SHA
-  e4297516c0e6cd13b5a8e3c5ef41cbc4bc843e41. The manifest retains h2 ^0.4.14.
+  ba6b4e6e89849c480c7b1c5312aff539d0f1b658. The manifest retains h2 ^0.4.14.
 - `cargo <overrides> test --features full --test client http2_graceful_goaway_capture_survives_ok`: exit 0, 1 passed.
 - `cargo <overrides> test --features full --test client`: exit 0, 69 passed.
 - `cargo <overrides> test --features full --lib`: exit 0, 117 passed, 6 ignored.
@@ -108,11 +108,11 @@ lines 57-65. The same lines are unchanged from base 60bb53e5, so this is a
 baseline formatting mismatch, not W5d behavior. The earlier fmt pass is not a
 pass for the pinned tree. No out-of-scope formatting repair is included.
 The GOAWAY/client/lib results above remain code evidence; h2 stays exactly
-e4297516c0e6cd13b5a8e3c5ef41cbc4bc843e41. This evidence correction changes no Rust.
+ba6b4e6e89849c480c7b1c5312aff539d0f1b658. This evidence correction changes no Rust.
 
 Final h2 tip verification on macOS arm64, hyper source tip
-e18cacb5a2da056382bc25682ee2ecdee600ec96 (no Rust changes): all six commands
-listed above were rerun with h2 e4297516c0e6cd13b5a8e3c5ef41cbc4bc843e41.
+fa17d21963fd744c640535d1f2229c3f33d0cb61 (no Rust changes): all six commands
+listed above were rerun with h2 ba6b4e6e89849c480c7b1c5312aff539d0f1b658.
 Update, metadata, successful-drain test (1 passed), client tests (69 passed),
 and library tests (117 passed, six ignored) exited 0. Formatting exited 1 at
 unchanged src/ext/mod.rs:57-65. Metadata and lock independently confirm exactly
@@ -124,3 +124,18 @@ Clippy and formatting failures from W5d gates. No unrelated fixes, lint waiver
 or issue is included. Every Cargo command used both h2 overrides and build-slot.
 
 Baseline diagnostic file inventory: `src/body/incoming.rs`, `src/client/conn/http2.rs`, `src/client/dispatch.rs`, `src/common/date.rs`, `src/common/io/compat.rs`, `src/error.rs`, `src/ext/h1_reason_phrase.rs`, `src/ext/mod.rs`, `src/headers.rs`, `src/lib.rs`, `src/proto/h1/conn.rs`, `src/proto/h1/decode.rs`, `src/proto/h1/dispatch.rs`, `src/proto/h1/encode.rs`, `src/proto/h1/io.rs`, `src/proto/h1/role.rs`, `src/proto/h2/client.rs`, `src/upgrade.rs`.
+
+Final audited h2 tip after its evidence-only commit: all seven commands above
+(update, metadata, drain test, client tests, library tests, fmt and strict Clippy)
+were rerun on macOS arm64 at hyper source tip
+fa17d21963fd744c640535d1f2229c3f33d0cb61, with both h2 overrides set to
+ba6b4e6e89849c480c7b1c5312aff539d0f1b658. Update/metadata/drain/client/lib exit 0;
+drain 1 passed, client 69 passed, library 117 passed and six ignored. Formatting
+exits 1 in unchanged src/ext/mod.rs; strict Clippy exits 101 in the baseline
+files inventoried above. The owner excludes these unchanged-code failures from
+the W5d gate; no repair or issue is included. Independent metadata and lock
+inspection exits 0 and confirms exactly one h2 package, version 0.4.19, at that
+full SHA. The approved mechanical departure uses this same full SHA for
+`--precise` and `patch.crates-io.h2.rev`; Cargo interprets a git-patched
+`--precise` as a revision, so `--precise 0.4.19` is not runnable. No h2 commit
+followed this verification.
