@@ -107,8 +107,9 @@ h2 overrides exits 1: the current rustfmt reorders informational re-exports at
 lines 57-65. The same lines are unchanged from base 60bb53e5, so this is a
 baseline formatting mismatch, not W5d behavior. The earlier fmt pass is not a
 pass for the pinned tree. No out-of-scope formatting repair is included.
-The GOAWAY/client/lib results above remain code evidence; h2 stays exactly
-ba6b4e6e89849c480c7b1c5312aff539d0f1b658. This evidence correction changes no Rust.
+The earlier GOAWAY/client/lib results remain historical code evidence. The
+final rerun below uses the final h2 work tip. This evidence correction changes
+no Rust.
 
 Final h2 tip verification on macOS arm64, hyper source tip
 fa17d21963fd744c640535d1f2229c3f33d0cb61 (no Rust changes): all six commands
