@@ -34,6 +34,24 @@ use h2::client::ResponseFuture;
 
 type ClientRx<B> = crate::client::dispatch::Receiver<Request<B>, Response<IncomingBody>>;
 
+/// The original connection error retained before its dispatcher is closed.
+#[derive(Clone, Default)]
+pub(crate) struct CloseReason(std::sync::Arc<std::sync::Mutex<Option<::h2::Error>>>);
+
+impl CloseReason {
+    pub(crate) fn error(&self) -> Option<::h2::Error> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn remember(&self, error: &::h2::Error) {
+        let mut first = self.0.lock().unwrap();
+        if first.is_none() {
+            *first = Some(error.clone());
+        }
+    }
+}
+
+
 ///// An mpsc channel is used to help notify the `Connection` task when *all*
 ///// other handles to it have been dropped, so that it can shutdown.
 type ConnDropRef = mpsc::Sender<Infallible>;
@@ -156,6 +174,7 @@ pub(crate) async fn handshake<T, B, E>(
     config: &Config,
     mut exec: E,
     timer: Time,
+    close_reason: CloseReason,
 ) -> crate::Result<ClientTask<B, E, T>>
 where
     T: Read + Write + Unpin,
@@ -197,6 +216,7 @@ where
     });
 
     Ok(ClientTask {
+        close_reason,
         ping,
         conn_drop_ref,
         conn_eof,
@@ -430,6 +450,7 @@ where
     B: Body,
     E: Unpin,
 {
+    close_reason: CloseReason,
     ping: ping::Recorder,
     conn_drop_ref: ConnDropRef,
     conn_eof: ConnEof,
@@ -698,6 +719,7 @@ where
                 Ok(()) => (),
                 Err(err) => {
                     self.ping.ensure_not_timed_out()?;
+                    self.close_reason.remember(&err);
                     return if err.reason() == Some(::h2::Reason::NO_ERROR) {
                         trace!("connection gracefully shutdown");
                         Poll::Ready(Ok(Dispatched::Shutdown))

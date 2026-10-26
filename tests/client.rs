@@ -3485,3 +3485,145 @@ async fn http2_graceful_goaway_capture_survives_ok() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn http2_poll_ready_retains_received_goaway() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for reason in [Some(11u32), Some(0), None] {
+        let (io, mut peer) = tokio::io::duplex(4096);
+        let capture = h2::GoAwayCapture::default();
+        let (go, sent) = oneshot::channel();
+        let (release, finished) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut preface = [0; 24];
+            peer.read_exact(&mut preface).await.unwrap();
+            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            peer.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await.unwrap();
+            loop {
+                let mut header = [0; 9];
+                peer.read_exact(&mut header).await.unwrap();
+                let len =
+                    ((header[0] as usize) << 16) | ((header[1] as usize) << 8) | header[2] as usize;
+                peer.read_exact(&mut vec![0; len]).await.unwrap();
+                if header[3] == 4 && header[4] == 0 {
+                    peer.write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0]).await.unwrap();
+                }
+                if header[3] == 1 {
+                    assert_eq!(&header[5..], &[0, 0, 0, 1]);
+                    break;
+                }
+            }
+            peer.write_all(&[0, 0, 1, 1, 5, 0, 0, 0, 1, 0x88])
+                .await
+                .unwrap();
+            sent.await.unwrap();
+            if let Some(code) = reason {
+                let mut frame = vec![0, 0, 14, 7, 0, 0, 0, 0, 0];
+                frame.extend_from_slice(&1u32.to_be_bytes());
+                frame.extend_from_slice(&code.to_be_bytes());
+                frame.extend_from_slice(b"\0\xffstay");
+                peer.write_all(&frame).await.unwrap();
+            }
+            finished.await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut remaining = Vec::new();
+            peer.read_to_end(&mut remaining).await.unwrap();
+        });
+        let (mut sender, connection) =
+            hyper::client::conn::http2::Builder::new(support::TokioExecutor)
+                .received_go_away(capture.clone())
+                .handshake::<_, http_body_util::Empty<Bytes>>(TokioIo::new(io))
+                .await
+                .unwrap();
+        let mut connection = Box::pin(connection);
+        let mut response = Box::pin(
+            sender.send_request(
+                Request::builder()
+                    .uri("https://example.com/")
+                    .body(http_body_util::Empty::new())
+                    .unwrap(),
+            ),
+        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            future::poll_fn(|cx| {
+                assert!(connection.as_mut().poll(cx).is_pending());
+                response.as_mut().poll(cx)
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = Box::pin(response.into_body().collect());
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            future::poll_fn(|cx| {
+                assert!(connection.as_mut().poll(cx).is_pending());
+                body.as_mut().poll(cx)
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        go.send(()).unwrap();
+        if let Some(code) = reason {
+            // The IO task keeps running while the public Connection is retained unpolled.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while capture.received().is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(10), connection)
+                .await
+                .unwrap();
+            assert_eq!(result.is_ok(), code == 0);
+        } else {
+            drop(connection);
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !sender.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let first = future::poll_fn(|cx| sender.poll_ready(cx))
+            .await
+            .unwrap_err();
+        let second = sender.clone().ready().await.unwrap_err();
+        for error in [first, second] {
+            let mut source: &(dyn std::error::Error + 'static) = &error;
+            let mut native = None;
+            loop {
+                if let Some(error) = source.downcast_ref::<h2::Error>() {
+                    native = Some(error);
+                    break;
+                }
+                match source.source() {
+                    Some(next) => source = next,
+                    None => break,
+                }
+            }
+            if let Some(code) = reason {
+                let native = native.expect("readiness retains its actual h2 error");
+                assert!(native.is_go_away() && native.is_remote());
+                assert_eq!(native.last_stream_id().unwrap().as_u32(), 1);
+                assert_eq!(u32::from(native.reason().unwrap()), code);
+                assert_eq!(native.debug_data().unwrap(), b"\0\xffstay");
+            } else {
+                assert!(error.is_closed());
+                assert!(native.is_none());
+                assert!(capture.received().is_none());
+            }
+        }
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}

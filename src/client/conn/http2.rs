@@ -22,12 +22,14 @@ use crate::rt::Timer;
 
 /// The sender side of an established connection.
 pub struct SendRequest<B> {
+    close_reason: proto::h2::client::CloseReason,
     dispatch: dispatch::UnboundedSender<Request<B>, Response<IncomingBody>>,
 }
 
 impl<B> Clone for SendRequest<B> {
     fn clone(&self) -> SendRequest<B> {
         SendRequest {
+            close_reason: self.close_reason.clone(),
             dispatch: self.dispatch.clone(),
         }
     }
@@ -100,7 +102,10 @@ impl<B> SendRequest<B> {
     /// If the associated connection is closed, this returns an Error.
     pub fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         if self.is_closed() {
-            Poll::Ready(Err(crate::Error::new_closed()))
+            Poll::Ready(Err(self.close_reason.error().map_or_else(
+                crate::Error::new_closed,
+                crate::Error::new_h2,
+            )))
         } else {
             Poll::Ready(Ok(()))
         }
@@ -588,10 +593,13 @@ where
             trace!("client handshake HTTP/2");
 
             let (tx, rx) = dispatch::channel();
-            let h2 = proto::h2::client::handshake(io, rx, &opts.h2_builder, opts.exec, opts.timer)
-                .await?;
+            let close_reason = proto::h2::client::CloseReason::default();
+            let h2 = proto::h2::client::handshake(
+                io, rx, &opts.h2_builder, opts.exec, opts.timer, close_reason.clone(),
+            ).await?;
             Ok((
                 SendRequest {
+                    close_reason,
                     dispatch: tx.unbound(),
                 },
                 Connection {
