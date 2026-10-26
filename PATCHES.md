@@ -66,3 +66,35 @@ thread, between `send_request` and the readiness check until then, through a
 second polls the dispatcher itself, with `initial_max_send_streams(1)`.
 Without the change they fail (exit 101) with `GoAway(NO_ERROR, Remote)` and
 `DispatchGone`; with it they pass (exit 0).
+
+## Successful-drain GOAWAY capture (Boundless W5d / #287)
+
+A received GOAWAY can finish the native connection successfully and never enter
+an error conversion. The HTTP/2 builder forwards an immutable h2 GoAwayCapture
+before handshake through proto::h2::client::new_builder. The public builder
+asserts configuration once; only h2's accepted receive entry fills the capture.
+No response extension, retry policy or change to the Ok drive result is added.
+
+macOS arm64 regression evidence, code tip
+2f5d27ae5916ff419b79e6c8c62cfd4d2c85f0cb, features `full`:
+all Cargo commands below use both overrides:
+`--config 'patch.crates-io.h2.git="https://github.com/XiiTang/h2"'`
+and `--config 'patch.crates-io.h2.rev="db341210890d8e95381c13b49b8356c43da552a4"'`.
+
+- `cargo <overrides> update -p h2 --precise db341210890d8e95381c13b49b8356c43da552a4`: exit 0.
+- `cargo <overrides> metadata --features full --format-version 1 --locked`: exit 0.
+  Metadata and Cargo.lock each contain one h2 package, version 0.4.19, git SHA
+  db341210890d8e95381c13b49b8356c43da552a4. The manifest retains h2 ^0.4.14.
+- `cargo <overrides> test --features full --test client http2_graceful_goaway_capture_survives_ok`: exit 0, 1 passed.
+- `cargo <overrides> test --features full --test client`: exit 0, 69 passed.
+- `cargo <overrides> test --features full --lib`: exit 0, 117 passed, 6 ignored.
+- `cargo <overrides> fmt --all --check`: exit 0.
+
+The landing owner approved a mechanical departure from design revision 7:
+`--precise 0.4.19` failed with exit 101 because Cargo interpreted it as a git
+revision for the patched dependency. The corrected update uses the same full
+h2 SHA for the rev override and --precise, then checks package version separately.
+No registry-only or path-override run counts as evidence. The isolated test
+Cargo.lock is not committed. Existing ignored tests remain the five
+client::conn::http2 executor send/sync compile checks and
+proto::h1::io::tests::iobuf_write_empty_slice.
