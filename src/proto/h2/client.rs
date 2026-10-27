@@ -40,11 +40,11 @@ pub(crate) struct CloseReason(std::sync::Arc<std::sync::Mutex<Option<::h2::Error
 
 impl CloseReason {
     pub(crate) fn error(&self) -> Option<::h2::Error> {
-        self.0.lock().unwrap().clone()
+        self.0.lock().expect("CloseReason lock poisoned").clone()
     }
 
     fn remember(&self, error: &::h2::Error) {
-        let mut first = self.0.lock().unwrap();
+        let mut first = self.0.lock().expect("CloseReason lock poisoned");
         if first.is_none() {
             *first = Some(error.clone());
         }

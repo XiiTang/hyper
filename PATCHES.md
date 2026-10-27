@@ -142,7 +142,7 @@ full SHA. The approved mechanical departure uses this same full SHA for
 followed this verification.
 
 
-## W5d fix8 readiness retention — WIP, blocked before native regressions
+## Historical W5d fix8 readiness attempt — before approved h2 Error Clone
 
 The native readiness error must be retained before dispatcher destruction, at
 ClientTask::poll's existing h2 readiness Err branch after the ping-timeout guard.
@@ -178,3 +178,60 @@ exits 1 only for unchanged src/ext/mod.rs:57-65. With the same two overrides,
 metadata and lock inspection exits 0: one h2 0.4.19 at that full SHA. These
 checks do not resolve the h2::Error Clone compile blocker or count as native
 readiness regression passes. Boundless remains on its last buildable hyper pin.
+
+
+## Readiness retention with approved h2 Error Clone (W5d T9)
+
+The approved h2 Clone patch resolves the historical compilation blocker above.
+Every command in this round selects full h2 SHA
+`6fb69bafce0d270323bef733147739167863f6c2` via both overrides:
+`--config 'patch.crates-io.h2.git="https://github.com/XiiTang/h2"'`
+and `--config 'patch.crates-io.h2.rev="6fb69bafce0d270323bef733147739167863f6c2"'`.
+The same full SHA is passed to `update -p h2 --precise`; no version substitution.
+The latch remains Arc<Mutex<Option<h2::Error>>>: one private first writer in
+ClientTask::poll, after ping-timeout priority and before dispatcher destruction;
+public SendRequest::poll_ready's closed branch is the sole reader. Cloned
+senders share this fixed association. Poisoned-lock panic behavior is retained
+with descriptive expect calls, matching the crate's existing Clippy policy.
+
+Evidence on macOS arm64, Rust1.98.1, source based on24a7d63b with the final
+fixture slice comparison and lock-message adjustments committed here:
+
+- `build-slot cargo <overrides> update -p h2 --precise 6fb69bafce0d270323bef733147739167863f6c2`:
+  exit0. `metadata --features full --format-version 1 --locked`: exit0;
+  metadata and lock contain one h2 package, version0.4.19 at that full SHA.
+- `build-slot cargo <overrides> test --features full --test client --locked -- http2_poll_ready_retains_received_goaway http2_graceful_goaway_capture_survives_ok`:
+  exit0, two passed. Nonzero/NO_ERROR received frames and local dispatcher drop
+  all run; readiness facts come from its actual returned Error/source chain.
+- `build-slot cargo <overrides> test --features full --test client --locked`:
+  exit0,70 passed.
+- `build-slot cargo <overrides> test --features full --lib --locked`:
+  exit0,117 passed/six existing ignored, including both counted-stream tests.
+- `build-slot cargo <overrides> build --features full --lib --locked`: exit0.
+- `build-slot cargo clippy <overrides> --features full --lib --tests --locked -- -D warnings`:
+  exit101, unchanged baseline two library/214 library-test diagnostics in the
+  previously inventoried files. The two latch unwrap findings introduced in
+  this WIP were corrected to expect; no remaining latch diagnostic, unrelated
+  repair or lint waiver.
+- `build-slot cargo <overrides> fmt --all --check`: exit1 only in unchanged
+  src/ext/mod.rs:57-65. The owner-excluded baseline remains unmodified.
+
+Command/fixture failures retained as historical evidence: the first newly
+compilable native test compared Bytes to a byte array (E0277,exit101); comparing
+its same contents as slices fixes that fixture typing without changing its
+assertion. The first strict command placed --config before external clippy;
+those options were not forwarded to cargo-clippy, which attempted registry
+h2 0.4.20 and failed the locked check (exit101). An offline generation diagnostic
+then selected registry h2 and failed with missing fork APIs (exit101). The
+previous Cargo-generated isolated lock was restored intact, the approved
+full-SHA update rerun (exit0), and clippy's two overrides placed after `clippy`,
+where its parser forwards them. Locked Clippy then reaches the actual git h2
+and baseline diagnostics above. Final metadata exits0 and confirms the sole
+patched h2; the temporary registry resolution is not a regression pass or a
+production pin. The first update against that registry diagnostic lock exited101
+because --precise was interpreted as a registry version; the restored generated
+lock fixes that mechanical setup without hand editing it.
+
+No h2 commit follows this verification. Boundless must use this same h2 SHA
+and the resulting full hyper work tip. No request lifecycle, IO result,
+counted-stream scheduling or retry policy was changed.

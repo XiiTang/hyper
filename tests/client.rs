@@ -3613,7 +3613,7 @@ async fn http2_poll_ready_retains_received_goaway() {
                 assert!(native.is_go_away() && native.is_remote());
                 assert_eq!(native.last_stream_id().unwrap().as_u32(), 1);
                 assert_eq!(u32::from(native.reason().unwrap()), code);
-                assert_eq!(native.debug_data().unwrap(), b"\0\xffstay");
+                assert_eq!(native.debug_data().unwrap().as_ref(), b"\0\xffstay");
             } else {
                 assert!(error.is_closed());
                 assert!(native.is_none());
