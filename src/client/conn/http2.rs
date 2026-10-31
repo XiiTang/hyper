@@ -172,7 +172,10 @@ where
         async move {
             match sent {
                 Ok(rx) => match rx.await {
-                    Ok(Ok(resp)) => Ok(resp),
+                    Ok(Ok(mut resp)) => {
+                        resp.body_mut().returned();
+                        Ok(resp)
+                    }
                     Ok(Err(err)) => Err(err),
                     // this is definite bug if it happens, but it shouldn't happen!
                     Err(_canceled) => panic!("dispatch dropped without returning error"),
@@ -203,7 +206,10 @@ where
         async move {
             match sent {
                 Ok(rx) => match rx.await {
-                    Ok(Ok(res)) => Ok(res),
+                    Ok(Ok(mut res)) => {
+                        res.body_mut().returned();
+                        Ok(res)
+                    }
                     Ok(Err(err)) => Err(err),
                     // this is definite bug if it happens, but it shouldn't happen!
                     Err(_) => panic!("dispatch dropped without returning error"),

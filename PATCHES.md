@@ -32,6 +32,43 @@ Regression evidence: `tests/client.rs`
 `h2_pipe_task_cancelled_on_response_body_drop` fails without the change and
 passes with it; `cargo test --features full` passes on macOS arm64.
 
+### A response never returned to its caller (2026-10-31, Boundless W4a-1)
+
+The body-drop cancel fired only for a response dropped before its end. A
+complete (END_STREAM) response whose caller left before it was returned was
+dropped at its end, so its cancel sender dropped without cancelling and the
+pipe kept waiting for capacity: `SendWhen::poll` (`src/client/dispatch.rs`)
+takes a ready response before it checks callback cancellation and
+`Callback::send` discards an undeliverable one, and a response already in
+the oneshot drops with its receiver. h2 keeps the send half alive while the
+pipe holds its reference (`RecvStream::drop`, `is_canceled_interest`), so
+the abandoned upload held its stream and buffered chunk until the
+connection closed. `Incoming` now records whether the conn-level response
+future (`SendRequest::{send_request, try_send_request}`) returned it; one
+never returned resets its stream on drop even at its end. A returned
+complete response keeps its upload going, as upstream does: HTTP/2 lets a
+server finish its response while the request is still being sent (RFC 9113
+section 8.1).
+
+Upstream at c954d80c has the same response-first `SendWhen`
+(`src/client/dispatch.rs:354-383`) and no post-head handover of the cancel
+sender (`src/proto/h2/client.rs:650-654`), so upstream continues the upload
+of every response, returned or not, until the peer resets the stream or the
+connection closes.
+
+Regression evidence (macOS arm64, h2 override
+f93da54639b7bcac6857fd83fb4246662192ad45): `tests/client.rs`
+`h2_pipe_task_cancelled_when_response_is_never_returned` holds the send and
+pipe tasks in a test executor until the response has been read, then drops
+the waiter before (closed callback) and after (oneshot) the send task
+delivers it; the peer sees RST_STREAM(CANCEL) on that stream and a sibling
+then answers on the same connection. Without the change it fails (exit 101,
+no reset); with it `cargo test --features full --test client` (71 passed)
+and `--lib` (117 passed, 6 ignored) exit 0. That run's `cargo fmt --all
+--check` also reported the new test's assertions in `tests/client.rs`, which
+were then formatted; on the final tree it exits 1, reporting only
+the unchanged baseline `src/ext/mod.rs:57-65` noted below.
+
 ## A request handed to h2 takes its own stream's result (Boundless #354, driver plan v23 Rule 8)
 
 At e158e802, as on upstream master c954d80c, the HTTP/2 client dispatcher

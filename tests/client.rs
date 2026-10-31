@@ -3225,6 +3225,148 @@ mod conn {
         assert!(got_rst, "server should receive RST_STREAM");
     }
 
+    // A response that its caller left before the response future returned it
+    // was never anyone's: dropping it resets a request body still waiting for
+    // flow-control capacity, even when the response has already ended. The
+    // caller leaves in both places a ready response can be abandoned: before
+    // the send task delivers it, and after delivery but before the response
+    // future returns it.
+    #[tokio::test]
+    async fn h2_pipe_task_cancelled_when_response_is_never_returned() {
+        use std::future::Future;
+        use std::sync::{Arc, Mutex};
+
+        type Held = Pin<Box<dyn Future<Output = ()> + Send>>;
+        /// Holds the request's send and pipe tasks while `held` is set, so the
+        /// test decides when they first run; the connection task was
+        /// submitted before.
+        #[derive(Clone)]
+        struct HeldExecutor {
+            held: Arc<Mutex<Option<Vec<Held>>>>,
+            finished: Arc<tokio::sync::Semaphore>,
+        }
+        impl HeldExecutor {
+            fn new() -> Self {
+                Self {
+                    held: Arc::default(),
+                    finished: Arc::new(tokio::sync::Semaphore::new(0)),
+                }
+            }
+            fn hold(&self) {
+                *self.held.lock().unwrap() = Some(Vec::new());
+            }
+            fn release(&self) {
+                let held = self.held.lock().unwrap().take().unwrap_or_default();
+                for future in held {
+                    self.spawn(future);
+                }
+            }
+            fn spawn(&self, future: Held) {
+                let finished = self.finished.clone();
+                tokio::spawn(async move {
+                    future.await;
+                    finished.add_permits(1);
+                });
+            }
+        }
+        impl<F> hyper::rt::Executor<F> for HeldExecutor
+        where
+            F: Future + Send + 'static,
+            F::Output: Send + 'static,
+        {
+            fn execute(&self, future: F) {
+                let future: Held = Box::pin(async move {
+                    let _ = future.await;
+                });
+                let mut held = self.held.lock().unwrap();
+                match held.as_mut() {
+                    Some(held) => held.push(future),
+                    None => {
+                        drop(held);
+                        self.spawn(future);
+                    }
+                }
+            }
+        }
+
+        for delivered in [false, true] {
+            let (client_io, server_io, _) = setup_duplex_test_server();
+            let (answered_tx, answered_rx) = oneshot::channel::<()>();
+            let (rst_tx, rst_rx) = oneshot::channel::<bool>();
+
+            tokio::spawn(async move {
+                let mut builder = h2::server::Builder::new();
+                builder.initial_window_size(0);
+                let mut h2 = builder.handshake::<_, Bytes>(server_io).await.unwrap();
+                let mut ping_pong = h2.ping_pong().expect("ping pong");
+                let (req, mut respond) = h2.accept().await.unwrap().unwrap();
+                // Keep the connection alive and answer the later sibling.
+                tokio::spawn(async move {
+                    while let Some(Ok((_, mut respond))) = h2.accept().await {
+                        let _ = respond.send_response(http::Response::new(()), true);
+                    }
+                });
+                // A complete response, while the request body has no window.
+                let _send = respond
+                    .send_response(http::Response::new(()), true)
+                    .unwrap();
+                // The client acknowledges the PING after reading the response.
+                ping_pong.ping(h2::Ping::opaque()).await.unwrap();
+                answered_tx.send(()).unwrap();
+
+                let mut body = req.into_body();
+                let got_rst = tokio::time::timeout(Duration::from_secs(2), body.data())
+                    .await
+                    .map_or(false, |frame| match frame {
+                        Some(Err(error)) => error.reason() == Some(h2::Reason::CANCEL),
+                        _ => false,
+                    });
+                let _ = rst_tx.send(got_rst);
+            });
+
+            let executor = HeldExecutor::new();
+            let io = TokioIo::new(client_io);
+            let (mut client, conn) = conn::http2::Builder::new(executor.clone())
+                .handshake(io)
+                .await
+                .expect("http handshake");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+
+            executor.hold();
+            let req = Request::post("http://localhost/")
+                .body(Full::new(Bytes::from(vec![b'x'; 50])))
+                .unwrap();
+            // The request is dispatched now; its future is never polled.
+            let response = client.send_request(req);
+            answered_rx.await.expect("server answered");
+            if delivered {
+                // The send task hands the response to the waiting future,
+                // which never returns it.
+                executor.release();
+                let _ = executor.finished.acquire().await.unwrap();
+            }
+            drop(response);
+            executor.release();
+
+            let got_rst = rst_rx.await.expect("server task should complete");
+            assert!(
+                got_rst,
+                "server should receive RST_STREAM (delivered: {delivered})"
+            );
+
+            let sibling = Request::get("http://localhost/")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let res = client
+                .send_request(sibling)
+                .await
+                .expect("sibling response");
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+    }
+
     // https://github.com/hyperium/hyper/issues/4003
     //
     // An idle `PipeToSendStream` must not reserve any connection-level flow

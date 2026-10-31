@@ -72,6 +72,10 @@ enum Kind {
         /// body before the response ends resets the stream, as dropping the
         /// response future does before the headers arrive.
         cancel: Option<futures_channel::oneshot::Sender<()>>,
+        /// The client's response future returned this response to its
+        /// caller. A response dropped before that was never anyone's, so
+        /// it resets its stream even after the response has ended.
+        returned: bool,
     },
     #[cfg(feature = "ffi")]
     Ffi(crate::ffi::UserBody),
@@ -173,7 +177,17 @@ impl Incoming {
             content_length,
             recv,
             cancel,
+            returned: false,
         })
+    }
+
+    /// Marks a client response as returned to its caller by the response
+    /// future, so that its upload outlives its end like upstream's.
+    #[cfg(all(feature = "http2", feature = "client"))]
+    pub(crate) fn returned(&mut self) {
+        if let Kind::H2 { returned, .. } = &mut self.kind {
+            *returned = true;
+        }
     }
 
     #[cfg(feature = "ffi")]
@@ -192,17 +206,19 @@ impl Incoming {
 #[cfg(all(feature = "http2", any(feature = "client", feature = "server")))]
 impl Drop for Incoming {
     fn drop(&mut self) {
-        // A response dropped before its end leaves the request body's pipe
-        // waiting, perhaps for flow-control capacity the peer never grants;
-        // tell it to reset the stream, so the peer learns of the cancellation
-        // and the capacity is freed.
+        // A response dropped before its end, or never returned to the caller
+        // that left, leaves the request body's pipe waiting, perhaps for
+        // flow-control capacity the peer never grants; tell it to reset the
+        // stream, so the peer learns of the cancellation and the capacity is
+        // freed. A complete response its caller took keeps its upload going.
         if let Kind::H2 {
             recv,
             cancel: cancel @ Some(_),
+            returned,
             ..
         } = &mut self.kind
         {
-            if !recv.is_end_stream() {
+            if !*returned || !recv.is_end_stream() {
                 let _ = cancel.take().expect("matched Some").send(());
             }
         }
