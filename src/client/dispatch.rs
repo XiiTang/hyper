@@ -387,6 +387,24 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn dispatch_gone_distinguishes_dropped_callbacks_from_queued_requests() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), TrySendError<()>>>();
+        drop(Callback::Retry(Some(tx)));
+        let failure = rx.await.unwrap().unwrap_err();
+        assert!(failure.error().is_dispatch_gone());
+        assert!(failure.message().is_none());
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), TrySendError<()>>>();
+        drop(Envelope(Some(((), Callback::Retry(Some(tx))))));
+        let cancellation = rx.await.unwrap().unwrap_err();
+        assert!(cancellation.error().is_canceled());
+        assert!(!cancellation.error().is_dispatch_gone());
+        assert!(cancellation.message().is_some());
+        assert!(!crate::Error::new_closed().is_dispatch_gone());
+    }
+
     #[cfg(feature = "nightly")]
     extern crate test;
 
@@ -394,7 +412,7 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    use super::{channel, Callback, Receiver};
+    use super::{channel, Callback, Envelope, Receiver, TrySendError};
 
     #[derive(Debug)]
     struct Custom(#[allow(dead_code)] i32);

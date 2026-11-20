@@ -272,3 +272,14 @@ lock fixes that mechanical setup without hand editing it.
 No h2 commit follows this verification. Boundless must use this same h2 SHA
 and the resulting full hyper work tip. No request lifecycle, IO result,
 counted-stream scheduling or retry policy was changed.
+
+## Client dispatch callback classification
+
+Upstream v1.12.0 and the pinned v1.11.1-based tree distinguish a dropped
+unresolved callback (private `User::DispatchGone`, no request) from cancellation
+of a queued envelope (returned request). Readiness closure has its own kind.
+Expose only the callback's discriminator via `Error::is_dispatch_gone`. Preserve
+the error, its cause and the existing replay message. Boundless calls this at
+the gRPC H2 `try_send_request` response edge in `src/protocols/grpc/transport.rs`
+to observe the owning Link instead of reporting a Stream failure. The
+dispatch regression exercises both actual native drops and readiness closure.

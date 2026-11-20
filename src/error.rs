@@ -223,6 +223,21 @@ impl Error {
         matches!(self.inner.kind, Kind::User(_))
     }
 
+    /// Returns true if a client dispatch callback disappeared without an answer.
+    ///
+    /// This reports the callback's result and carries no claim that the request
+    /// was never processed.
+    pub fn is_dispatch_gone(&self) -> bool {
+        #[cfg(all(feature = "client", any(feature = "http1", feature = "http2")))]
+        {
+            matches!(self.inner.kind, Kind::User(User::DispatchGone))
+        }
+        #[cfg(not(all(feature = "client", any(feature = "http1", feature = "http2"))))]
+        {
+            false
+        }
+    }
+
     /// Returns true if this was about a `Request` that was canceled.
     ///
     /// This typically happens when a pending request is dropped before
