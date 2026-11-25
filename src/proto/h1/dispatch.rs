@@ -233,6 +233,7 @@ where
                     match body.poll_ready(cx) {
                         Poll::Ready(Ok(())) => (),
                         Poll::Pending => {
+                            self.conn.pause_observed_body();
                             self.body_tx.set(body);
                             return Poll::Pending;
                         }
@@ -313,8 +314,10 @@ where
                 let body = match body_len {
                     DecodedLength::ZERO => IncomingBody::empty(),
                     other => {
-                        let (tx, rx) =
-                            IncomingBody::new_channel(other, wants.contains(Wants::EXPECT));
+                        let (tx, rx) = IncomingBody::new_channel(
+                            other,
+                            wants.contains(Wants::EXPECT) || self.conn.observes_body(),
+                        );
                         self.body_tx.set(tx);
                         rx
                     }

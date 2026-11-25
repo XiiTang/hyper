@@ -6,6 +6,8 @@ use crate::body::DecodedLength;
 use crate::proto::{BodyLength, MessageHead};
 
 pub(crate) use self::conn::Conn;
+#[cfg(feature = "server")]
+pub use self::conn::ProgressObserver;
 pub(crate) use self::decode::Decoder;
 pub(crate) use self::dispatch::Dispatcher;
 pub(crate) use self::encode::{EncodedBuf, Encoder};

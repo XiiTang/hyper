@@ -283,3 +283,34 @@ the error, its cause and the existing replay message. Boundless calls this at
 the gRPC H2 `try_send_request` response edge in `src/protocols/grpc/transport.rs`
 to observe the owning Link instead of reporting a Stream failure. The
 dispatch regression exercises both actual native drops and readiness closure.
+
+## HTTP/1 server parser and flush observations
+
+Boundless must time a stalled upload while its consumer has an outstanding
+read. It also needs the exact framing boundary for close-only input disposal
+and a way to end an upload read while leaving a final response writable.
+The public `Incoming` body gives payload frames after decoding. It cannot
+report progress through chunk framing, incomplete framing after a receiver
+refusal, or when an interim `100 Continue` actually finishes flushing.
+
+Upstream uses `Incoming` receiver readiness to gate `100 Continue` before its
+first poll, and permits read-ahead after that poll. On a parser or transport
+error it closes the read state and returns that error through the Body channel.
+If the receiver declines the Body, it tries one cheap drain and otherwise
+closes the read side. The opt-in observer reports the parsed head and body
+boundary, positive decoder input, blocked decoding and output flush. It uses
+the same initial receiver gate even without `Expect`. Subsequent readiness
+remains channel capacity. A supplied read refusal takes the existing decoder
+error path and leaves the response writable. A pending interim flush does not
+count as a decoder wait. A cheap discard retains Hyper's existing behavior and
+still reports a confirmed framing boundary. Configurations without the observer
+retain the original read and flush behavior. The observer implements no timer
+or response policy.
+
+The v1.13.0 upstream source has no equivalent parser or flush observer. The
+Boundless integration consumes these observations in its native HTTP listener.
+The Linux focused witness
+`proto::h1::conn::tests::observed_upload_stop_leaves_the_response_writable`
+checks the received prefix, refusal and that a final head can still be written.
+It passed on the patch against `d4d96689` with Boundless's h2 pin. The Boundless
+peer tests cover independently withdrawing demand between frames.

@@ -16,7 +16,48 @@ use http::{HeaderMap, Method, Version};
 use http_body::Frame;
 use httparse::ParserConfig;
 
-use super::io::Buffered;
+use super::io::{Buffered, MemRead};
+
+/// Observes the HTTP/1 body decoder and encoded flush crossings. Enabled only
+/// on a server connection with an explicitly installed observer.
+pub trait ProgressObserver: fmt::Debug + Send + Sync {
+    /// The parser selected a new turn and its input framing.
+    fn head(&self, body_complete: bool);
+    /// The decoder consumed positive bytes of that turn, including framing.
+    fn body_progress(&self, count: usize);
+    /// The body channel can take another frame and the decoder needs input.
+    /// The observer may check for current consumer demand before returning
+    /// a read-side error. A stopped body still lets the service answer.
+    fn body_blocked(&self, cx: &mut Context<'_>) -> io::Result<()>;
+    /// The decoder is not currently waiting for input on the delivery path.
+    fn body_paused(&self);
+    /// Valid decoder completion, before publishing the last frame.
+    fn body_complete(&self);
+    /// The decoder or observer selected an error before Body delivery.
+    fn body_error(&self, error: &io::Error);
+    /// Encoded output or the underlying transport flush remains blocked.
+    fn flush_blocked(&self, cx: &mut Context<'_>) -> io::Result<()>;
+    /// The encoded output and its transport flush have drained.
+    fn flushed(&self);
+}
+
+struct ObservedRead<'a, R> {
+    input: &'a mut R,
+    observer: Option<&'a dyn ProgressObserver>,
+}
+impl<R: MemRead> MemRead for ObservedRead<'_, R> {
+    fn read_mem(&mut self, cx: &mut Context<'_>, len: usize) -> Poll<io::Result<Bytes>> {
+        let result = self.input.read_mem(cx, len);
+        if let Poll::Ready(Ok(bytes)) = &result {
+            if !bytes.is_empty() {
+                if let Some(observer) = self.observer {
+                    observer.body_progress(bytes.len());
+                }
+            }
+        }
+        result
+    }
+}
 use super::{Decoder, Encode, EncodedBuf, Encoder, Http1Transaction, ParseContext, Wants};
 use crate::body::DecodedLength;
 #[cfg(feature = "server")]
@@ -38,6 +79,8 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 pub(crate) struct Conn<I, B, T> {
     io: Buffered<I, EncodedBuf<B>>,
     state: State,
+    progress: Option<std::sync::Arc<dyn ProgressObserver>>,
+    continue_pending: bool,
     _marker: PhantomData<fn(T)>,
 }
 
@@ -84,6 +127,8 @@ where
                 version: Version::HTTP_11,
                 allow_trailer_fields: false,
             },
+            progress: None,
+            continue_pending: false,
             _marker: PhantomData,
         }
     }
@@ -96,6 +141,24 @@ where
     #[cfg(feature = "server")]
     pub(crate) fn set_flush_pipeline(&mut self, enabled: bool) {
         self.io.set_flush_pipeline(enabled);
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn set_progress_observer(
+        &mut self,
+        observer: Option<std::sync::Arc<dyn ProgressObserver>>,
+    ) {
+        self.progress = observer;
+    }
+
+    pub(super) fn observes_body(&self) -> bool {
+        self.progress.is_some()
+    }
+
+    pub(super) fn pause_observed_body(&self) {
+        if let Some(observer) = &self.progress {
+            observer.body_paused();
+        }
     }
 
     pub(crate) fn set_write_strategy_queue(&mut self) {
@@ -325,6 +388,10 @@ where
             ));
         }
 
+        self.continue_pending = false;
+        if let Some(observer) = &self.progress {
+            observer.head(msg.decode == DecodedLength::ZERO);
+        }
         self.state.allow_trailer_fields = headers::te_is_trailers(&msg.head.headers);
 
         Poll::Ready(Some(Ok((msg.head, msg.decode, wants))))
@@ -360,11 +427,42 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<io::Result<Frame<Bytes>>>> {
+        self.poll_body(cx, true)
+    }
+
+    fn poll_body(
+        &mut self,
+        cx: &mut Context<'_>,
+        delivering: bool,
+    ) -> Poll<Option<io::Result<Frame<Bytes>>>> {
         debug_assert!(self.can_read_body());
 
         let (reading, ret) = match &mut self.state.reading {
             Reading::Body(decoder) => {
-                match ready!(decoder.decode(cx, &mut self.io)) {
+                let mut input = ObservedRead {
+                    input: &mut self.io,
+                    observer: self.progress.as_deref().filter(|_| delivering),
+                };
+                let decoded = match decoder.decode(cx, &mut input) {
+                    Poll::Ready(decoded) => decoded,
+                    Poll::Pending => {
+                        let stop = if let Some(observer) = &self.progress {
+                            if delivering && !self.continue_pending {
+                                observer.body_blocked(cx).err()
+                            } else {
+                                observer.body_paused();
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        match stop {
+                            Some(error) => Err(error),
+                            None => return Poll::Pending,
+                        }
+                    }
+                };
+                match decoded {
                     Ok(frame) => {
                         if frame.is_data() {
                             let slice = frame.data_ref().unwrap_or_else(|| unreachable!());
@@ -408,15 +506,25 @@ where
                     trace!("automatically sending 100 Continue");
                     let cont = b"HTTP/1.1 100 Continue\r\n\r\n";
                     self.io.headers_buf().extend_from_slice(cont);
+                    self.continue_pending = self.progress.is_some();
                 }
 
                 // And now recurse once in the Reading::Body state...
                 self.state.reading = Reading::Body(decoder.clone());
-                return self.poll_read_body(cx);
+                return self.poll_body(cx, delivering);
             }
             _ => unreachable!("poll_read_body invalid state: {:?}", self.state.reading),
         };
 
+        if let Some(observer) = &self.progress {
+            if matches!(reading, Reading::KeepAlive) {
+                observer.body_complete();
+            }
+            if let Poll::Ready(Some(Err(error))) = &ret {
+                observer.body_error(error);
+            }
+            observer.body_paused();
+        }
         self.state.reading = reading;
         self.try_keep_alive(cx);
         ret
@@ -852,7 +960,22 @@ where
     }
 
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        ready!(Pin::new(&mut self.io).poll_flush(cx))?;
+        match Pin::new(&mut self.io).poll_flush(cx) {
+            Poll::Ready(result) => result?,
+            Poll::Pending => {
+                if let Some(observer) = &self.progress {
+                    observer.flush_blocked(cx)?;
+                }
+                return Poll::Pending;
+            }
+        }
+        if let Some(observer) = &self.progress {
+            observer.flushed();
+        }
+        if std::mem::take(&mut self.continue_pending) {
+            // The body decoder may now wait after the interim head drained.
+            self.state.notify_read = true;
+        }
         self.try_keep_alive(cx);
         trace!("flushed({}): {:?}", T::LOG, self.state);
         Poll::Ready(Ok(()))
@@ -879,7 +1002,8 @@ where
             self.state.reading = Reading::Body(decoder.clone());
         }
 
-        let _ = self.poll_read_body(cx);
+        self.pause_observed_body();
+        let _ = self.poll_body(cx, false);
 
         // If still in Reading::Body, just give up
         match self.state.reading {
@@ -1423,6 +1547,61 @@ mod tests {
                 "the complete body must return to head-reading state"
             );
         });
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn observed_upload_stop_leaves_the_response_writable() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug, Default)]
+        struct Observed(Mutex<Vec<&'static str>>);
+        impl ProgressObserver for Observed {
+            fn head(&self, complete: bool) {
+                assert!(!complete);
+                self.0.lock().unwrap().push("head");
+            }
+            fn body_progress(&self, _: usize) {
+                self.0.lock().unwrap().push("progress");
+            }
+            fn body_blocked(&self, _: &mut Context<'_>) -> io::Result<()> {
+                self.0.lock().unwrap().push("blocked");
+                Err(io::Error::new(io::ErrorKind::TimedOut, "body wait expired"))
+            }
+            fn body_paused(&self) {}
+            fn body_complete(&self) {
+                panic!("an incomplete upload did not reach its boundary");
+            }
+            fn body_error(&self, error: &io::Error) {
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                self.0.lock().unwrap().push("error");
+            }
+            fn flush_blocked(&self, _: &mut Context<'_>) -> io::Result<()> {
+                Ok(())
+            }
+            fn flushed(&self) {}
+        }
+        let observer = Arc::new(Observed::default());
+        let (io, _peer) = tokio_test::io::Builder::new()
+            .read(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n1")
+            .build_with_handle();
+        let mut conn = Conn::<_, Bytes, ServerTransaction>::new(Compat::new(io));
+        conn.set_progress_observer(Some(observer.clone()));
+        let (_, length, _) = ready(poll_head(&mut conn))
+            .expect("request")
+            .expect("valid request");
+        assert_eq!(length, DecodedLength::new(5));
+        tokio_test::task::spawn(()).enter(|cx, _| {
+            let prefix = ready(conn.poll_read_body(cx)).expect("body frame")
+                .expect("valid prefix").into_data().expect("data");
+            assert_eq!(prefix, "1");
+            let error = ready(conn.poll_read_body(cx)).expect("body end")
+                .expect_err("observer ended the stalled upload");
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(conn.is_read_closed());
+            assert!(conn.can_write_head(), "a final response is still possible");
+        });
+        assert_eq!(*observer.0.lock().unwrap(), ["head", "progress", "blocked", "error"]);
     }
 
     #[cfg(feature = "server")]

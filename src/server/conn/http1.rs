@@ -22,6 +22,8 @@ use crate::{
     rt::Timer,
 };
 
+pub use crate::proto::h1::ProgressObserver;
+
 type Http1Dispatcher<T, B, S> = proto::h1::Dispatcher<
     proto::h1::dispatch::Server<S, IncomingBody>,
     B,
@@ -78,6 +80,7 @@ pub struct Builder {
     h1_preserve_header_case: bool,
     h1_max_headers: Option<usize>,
     h1_header_read_timeout: Dur,
+    progress: Option<Arc<dyn ProgressObserver>>,
     h1_writev: Option<bool>,
     max_buf_size: Option<usize>,
     pipeline_flush: bool,
@@ -248,12 +251,22 @@ impl Builder {
             h1_preserve_header_case: false,
             h1_max_headers: None,
             h1_header_read_timeout: Dur::Default(Some(Duration::from_secs(30))),
+            progress: None,
             h1_writev: None,
             max_buf_size: None,
             pipeline_flush: false,
             date_header: true,
         }
     }
+    /// Installs the observer for this connection's body decoder and output
+    /// flush. Initial body reads wait for the receiver to be polled, as
+    /// for `Expect: 100-continue`. Subsequent sender readiness only shows
+    /// channel capacity. The observer decides whether a wait should end.
+    pub fn progress_observer(&mut self, observer: Arc<dyn ProgressObserver>) -> &mut Self {
+        self.progress = Some(observer);
+        self
+    }
+
     /// Set whether HTTP/1 connections should support half-closures.
     ///
     /// Clients can chose to shutdown their write-side while waiting
@@ -460,6 +473,7 @@ impl Builder {
         let mut conn = proto::Conn::new(io);
         conn.set_h1_parser_config(self.h1_parser_config.clone());
         conn.set_timer(self.timer.clone());
+        conn.set_progress_observer(self.progress.clone());
         if !self.h1_keep_alive {
             conn.disable_keep_alive();
         }
